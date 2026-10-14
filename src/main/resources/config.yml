@@ -1,0 +1,15 @@
+﻿snow-biome: "minecraft:snowy_plains"
+fallback-rain-biome: "minecraft:plains"
+per-chunk-roll: false
+
+accumulation:
+  allow-snow-layers: true
+  allow-ice-form: false
+
+probabilities:
+  snow: 65
+  rain: 20
+  thunder: 10
+  clear: 5
+
+chunks: []

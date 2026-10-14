@@ -1,0 +1,14 @@
+﻿name: SnowChunks
+version: '1.0.0'
+main: me.example.snowchunks.SnowChunksPlugin
+api-version: '26.3'
+description: Замена дождя на снег в выбранных чанках с настройкой вероятностей осадков
+commands:
+  snowchunks:
+    aliases: [sc, snowchunk]
+    description: Управление снежными чанками и осадками
+    permission: snowchunks.admin
+permissions:
+  snowchunks.admin:
+    description: Полный доступ к командам SnowChunks
+    default: op
