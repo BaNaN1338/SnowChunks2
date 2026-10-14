@@ -1,4 +1,4 @@
-name: Build Plugin JAR
+name: Auto Generate and Build Plugin JAR
 
 on:
   push:
@@ -8,22 +8,861 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up JDK 25
+      - name: Set up JDK 21 (for Gradle runner)
         uses: actions/setup-java@v4
         with:
-          java-version: '25'
+          java-version: '21'
           distribution: 'temurin'
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '9.0.0'
-      - name: Build with Gradle
+          gradle-version: '8.12.1'
+
+      - name: Generate Project Files and Compile
         run: |
-          if [ -f "SnowChunks/build.gradle.kts" ]; then cd SnowChunks; fi
-          gradle build
+          rm -rf *
+          mkdir -p src/main/java/me/example/snowchunks
+          mkdir -p src/main/resources
+
+          # Автоматическое определение доступной версии Paper API в репозитории PaperMC
+          METADATA=$(curl -s https://repo.papermc.io/repository/maven-public/io/papermc/paper/paper-api/maven-metadata.xml)
+          PAPER_VER=$(echo "$METADATA" | grep -oP '(?<=<version>)[^<]+' | grep '^26\.3' | tail -n 1 || true)
+          if [ -z "$PAPER_VER" ]; then
+            PAPER_VER=$(echo "$METADATA" | grep -oP '(?<=<version>)[^<]+' | grep '^26\.' | tail -n 1 || true)
+          fi
+          if [ -z "$PAPER_VER" ]; then
+            PAPER_VER=$(echo "$METADATA" | grep -oP '(?<=<version>)[^<]+' | grep '^1\.21' | tail -n 1 || true)
+          fi
+          if [ -z "$PAPER_VER" ]; then
+            PAPER_VER="1.21.4-R0.1-SNAPSHOT"
+          fi
+          echo "Выбрана версия Paper API: $PAPER_VER"
+
+          if [[ "$PAPER_VER" == 26.* ]]; then
+            JAVA_VER=25
+          else
+            JAVA_VER=21
+          fi
+
+          cat << 'EOF' > settings.gradle.kts
+          plugins {
+              id("org.gradle.toolchains.foojay-resolver-convention") version "0.9.0"
+          }
+          rootProject.name = "SnowChunks"
+          EOF
+
+          cat << EOF > build.gradle.kts
+          plugins {
+              java
+          }
+
+          group = "me.example"
+          version = "1.0.0"
+
+          repositories {
+              mavenCentral()
+              maven("https://repo.papermc.io/repository/maven-public/")
+          }
+
+          dependencies {
+              compileOnly("io.papermc.paper:paper-api:$PAPER_VER")
+          }
+
+          java {
+              toolchain.languageVersion.set(JavaLanguageVersion.of($JAVA_VER))
+          }
+
+          tasks.withType<JavaCompile> {
+              options.encoding = "UTF-8"
+          }
+          EOF
+
+          cat << 'EOF' > src/main/resources/plugin.yml
+          name: SnowChunks
+          version: '1.0.0'
+          main: me.example.snowchunks.SnowChunksPlugin
+          api-version: '1.21'
+          description: Замена дождя на снег в выбранных чанках с настройкой вероятностей осадков
+          commands:
+            snowchunks:
+              aliases: [sc, snowchunk]
+              description: Управление снежными чанками и осадками
+              permission: snowchunks.admin
+          permissions:
+            snowchunks.admin:
+              description: Полный доступ к командам SnowChunks
+              default: op
+          EOF
+
+          cat << 'EOF' > src/main/resources/config.yml
+          snow-biome: "minecraft:snowy_plains"
+          fallback-rain-biome: "minecraft:plains"
+          per-chunk-roll: false
+
+          accumulation:
+            allow-snow-layers: true
+            allow-ice-form: false
+
+          probabilities:
+            snow: 65
+            rain: 20
+            thunder: 10
+            clear: 5
+
+          chunks: []
+          EOF
+
+          cat << 'EOF' > src/main/java/me/example/snowchunks/WeatherMode.java
+          package me.example.snowchunks;
+
+          public enum WeatherMode {
+              SNOW,
+              RAIN,
+              THUNDER,
+              CLEAR
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/me/example/snowchunks/SnowChunksPlugin.java
+          package me.example.snowchunks;
+
+          import org.bukkit.command.PluginCommand;
+          import org.bukkit.plugin.java.JavaPlugin;
+
+          public final class SnowChunksPlugin extends JavaPlugin {
+
+              private ChunkWeatherManager weatherManager;
+
+              @Override
+              public void onEnable() {
+                  saveDefaultConfig();
+
+                  this.weatherManager = new ChunkWeatherManager(this);
+                  this.weatherManager.loadChunksFromConfig();
+
+                  getServer().getPluginManager().registerEvents(new WeatherListener(this, weatherManager), this);
+
+                  SnowCommand commandExecutor = new SnowCommand(this, weatherManager);
+                  PluginCommand cmd = getCommand("snowchunks");
+                  if (cmd != null) {
+                      cmd.setExecutor(commandExecutor);
+                      cmd.setTabCompleter(commandExecutor);
+                  }
+
+                  getLogger().info("SnowChunks успешно запущен!");
+              }
+
+              @Override
+              public void onDisable() {
+                  if (weatherManager != null) {
+                      weatherManager.resetAllPlayerWeather();
+                  }
+              }
+
+              public ChunkWeatherManager getWeatherManager() {
+                  return weatherManager;
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/me/example/snowchunks/ChunkWeatherManager.java
+          package me.example.snowchunks;
+
+          import io.papermc.paper.registry.RegistryAccess;
+          import io.papermc.paper.registry.RegistryKey;
+          import org.bukkit.Bukkit;
+          import org.bukkit.Chunk;
+          import org.bukkit.NamespacedKey;
+          import org.bukkit.Registry;
+          import org.bukkit.WeatherType;
+          import org.bukkit.World;
+          import org.bukkit.block.Biome;
+          import org.bukkit.configuration.ConfigurationSection;
+          import org.bukkit.entity.Player;
+          import org.bukkit.persistence.PersistentDataContainer;
+          import org.bukkit.persistence.PersistentDataType;
+
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.concurrent.ThreadLocalRandom;
+
+          public class ChunkWeatherManager {
+
+              private final SnowChunksPlugin plugin;
+              private final NamespacedKey origBiomesKey;
+              private final NamespacedKey wandKey;
+
+              private final Set<String> selectedChunks = new HashSet<>();
+              private final Map<String, WeatherMode> chunkModes = new HashMap<>();
+              private WeatherMode globalRolledMode = WeatherMode.SNOW;
+
+              public ChunkWeatherManager(SnowChunksPlugin plugin) {
+                  this.plugin = plugin;
+                  this.origBiomesKey = new NamespacedKey(plugin, "original_surface_biomes");
+                  this.wandKey = new NamespacedKey(plugin, "chunk_selector_wand");
+              }
+
+              public NamespacedKey getWandKey() {
+                  return wandKey;
+              }
+
+              public String toKey(World world, int chunkX, int chunkZ) {
+                  return world.getName() + ":" + chunkX + ":" + chunkZ;
+              }
+
+              public String toKey(Chunk chunk) {
+                  return toKey(chunk.getWorld(), chunk.getX(), chunk.getZ());
+              }
+
+              public void loadChunksFromConfig() {
+                  selectedChunks.clear();
+                  chunkModes.clear();
+                  List<String> list = plugin.getConfig().getStringList("chunks");
+                  selectedChunks.addAll(list);
+                  rollWeatherForAllChunks();
+              }
+
+              public void saveChunksToConfig() {
+                  plugin.getConfig().set("chunks", new ArrayList<>(selectedChunks));
+                  plugin.saveConfig();
+              }
+
+              public boolean isManagedChunk(Chunk chunk) {
+                  return selectedChunks.contains(toKey(chunk));
+              }
+
+              public Set<String> getSelectedChunks() {
+                  return Collections.unmodifiableSet(selectedChunks);
+              }
+
+              public WeatherMode getChunkMode(Chunk chunk) {
+                  String key = toKey(chunk);
+                  if (plugin.getConfig().getBoolean("per-chunk-roll", false)) {
+                      return chunkModes.computeIfAbsent(key, k -> rollSingleProbability());
+                  }
+                  return globalRolledMode;
+              }
+
+              public boolean addChunk(Chunk chunk) {
+                  String key = toKey(chunk);
+                  if (!selectedChunks.add(key)) {
+                      return false;
+                  }
+                  backupOriginalBiomes(chunk);
+                  WeatherMode mode = getChunkMode(chunk);
+                  applyChunkBiomeForMode(chunk, mode);
+                  updatePlayersInChunk(chunk);
+                  saveChunksToConfig();
+                  return true;
+              }
+
+              public boolean removeChunk(Chunk chunk) {
+                  String key = toKey(chunk);
+                  if (!selectedChunks.remove(key)) {
+                      return false;
+                  }
+                  chunkModes.remove(key);
+                  restoreOriginalBiomes(chunk);
+                  for (Player player : chunk.getWorld().getPlayers()) {
+                      if (player.getLocation().getChunk().equals(chunk)) {
+                          player.resetPlayerWeather();
+                      }
+                  }
+                  saveChunksToConfig();
+                  return true;
+              }
+
+              public WeatherMode rollSingleProbability() {
+                  ConfigurationSection sec = plugin.getConfig().getConfigurationSection("probabilities");
+                  double snow = sec != null ? Math.max(0, sec.getDouble("snow", 65)) : 65;
+                  double rain = sec != null ? Math.max(0, sec.getDouble("rain", 20)) : 20;
+                  double thunder = sec != null ? Math.max(0, sec.getDouble("thunder", 10)) : 10;
+                  double clear = sec != null ? Math.max(0, sec.getDouble("clear", 5)) : 5;
+
+                  double total = snow + rain + thunder + clear;
+                  if (total <= 0) {
+                      return WeatherMode.SNOW;
+                  }
+
+                  double roll = ThreadLocalRandom.current().nextDouble(total);
+                  if (roll < snow) return WeatherMode.SNOW;
+                  roll -= snow;
+                  if (roll < rain) return WeatherMode.RAIN;
+                  roll -= rain;
+                  if (roll < thunder) return WeatherMode.THUNDER;
+                  return WeatherMode.CLEAR;
+              }
+
+              public WeatherMode rollWeatherForAllChunks() {
+                  globalRolledMode = rollSingleProbability();
+                  chunkModes.clear();
+
+                  for (String key : selectedChunks) {
+                      WeatherMode mode = plugin.getConfig().getBoolean("per-chunk-roll", false)
+                              ? rollSingleProbability()
+                              : globalRolledMode;
+                      chunkModes.put(key, mode);
+                      applyToLoadedChunkKey(key, mode);
+                  }
+                  return globalRolledMode;
+              }
+
+              public void forceWeatherMode(WeatherMode mode) {
+                  this.globalRolledMode = mode;
+                  for (String key : selectedChunks) {
+                      chunkModes.put(key, mode);
+                      applyToLoadedChunkKey(key, mode);
+                  }
+              }
+
+              private void applyToLoadedChunkKey(String key, WeatherMode mode) {
+                  String[] parts = key.split(":");
+                  if (parts.length != 3) return;
+
+                  World world = Bukkit.getWorld(parts[0]);
+                  if (world == null) return;
+
+                  try {
+                      int cx = Integer.parseInt(parts[1]);
+                      int cz = Integer.parseInt(parts[2]);
+                      if (world.isChunkLoaded(cx, cz)) {
+                          Chunk chunk = world.getChunkAt(cx, cz);
+                          applyChunkBiomeForMode(chunk, mode);
+                          updatePlayersInChunk(chunk);
+                      }
+                  } catch (NumberFormatException ignored) {
+                  }
+              }
+
+              public void backupOriginalBiomes(Chunk chunk) {
+                  PersistentDataContainer pdc = chunk.getPersistentDataContainer();
+                  if (pdc.has(origBiomesKey, PersistentDataType.STRING)) {
+                      return;
+                  }
+
+                  World world = chunk.getWorld();
+                  int baseX = chunk.getX() << 4;
+                  int baseZ = chunk.getZ() << 4;
+                  Registry<Biome> registry = RegistryAccess.registryAccess().getRegistry(RegistryKey.BIOME);
+
+                  StringBuilder sb = new StringBuilder();
+                  for (int lx = 0; lx < 16; lx += 4) {
+                      for (int lz = 0; lz < 16; lz += 4) {
+                          int wx = baseX + lx;
+                          int wz = baseZ + lz;
+                          int surfaceY = world.getHighestBlockYAt(wx, wz);
+                          Biome biome = world.getBiome(wx, surfaceY, wz);
+                          NamespacedKey bKey = registry.getKey(biome);
+                          if (!sb.isEmpty()) sb.append(",");
+                          sb.append(bKey != null ? bKey.asString() : "minecraft:plains");
+                      }
+                  }
+                  pdc.set(origBiomesKey, PersistentDataType.STRING, sb.toString());
+              }
+
+              public void applyChunkBiomeForMode(Chunk chunk, WeatherMode mode) {
+                  backupOriginalBiomes(chunk);
+                  World world = chunk.getWorld();
+
+                  if (mode == WeatherMode.SNOW || mode == WeatherMode.THUNDER) {
+                      Biome snowBiome = resolveBiome(plugin.getConfig().getString("snow-biome", "minecraft:snowy_plains"), Biome.SNOWY_PLAINS);
+                      setSurfaceToSkyBiome(chunk, snowBiome);
+                      if (mode == WeatherMode.THUNDER && world.hasStorm() && !world.isThundering()) {
+                          world.setThundering(true);
+                      }
+                  } else if (mode == WeatherMode.RAIN) {
+                      restoreOrFallbackRainBiome(chunk);
+                  } else if (mode == WeatherMode.CLEAR) {
+                      restoreOriginalBiomesWithoutRemove(chunk);
+                  }
+              }
+
+              private void setSurfaceToSkyBiome(Chunk chunk, Biome targetBiome) {
+                  World world = chunk.getWorld();
+                  int baseX = chunk.getX() << 4;
+                  int baseZ = chunk.getZ() << 4;
+                  int maxY = world.getMaxHeight();
+                  int minY = world.getMinHeight();
+
+                  for (int lx = 0; lx < 16; lx += 4) {
+                      for (int lz = 0; lz < 16; lz += 4) {
+                          int wx = baseX + lx;
+                          int wz = baseZ + lz;
+                          int startY = Math.max(minY, world.getHighestBlockYAt(wx, wz) - 8);
+                          for (int y = startY; y < maxY; y += 4) {
+                              world.setBiome(wx, y, wz, targetBiome);
+                          }
+                      }
+                  }
+                  world.refreshChunk(chunk.getX(), chunk.getZ());
+              }
+
+              private void restoreOrFallbackRainBiome(Chunk chunk) {
+                  PersistentDataContainer pdc = chunk.getPersistentDataContainer();
+                  String saved = pdc.get(origBiomesKey, PersistentDataType.STRING);
+                  Biome fallbackRain = resolveBiome(plugin.getConfig().getString("fallback-rain-biome", "minecraft:plains"), Biome.PLAINS);
+
+                  if (saved == null || saved.isEmpty()) {
+                      setSurfaceToSkyBiome(chunk, fallbackRain);
+                      return;
+                  }
+
+                  String[] keys = saved.split(",");
+                  World world = chunk.getWorld();
+                  int baseX = chunk.getX() << 4;
+                  int baseZ = chunk.getZ() << 4;
+                  int maxY = world.getMaxHeight();
+                  int minY = world.getMinHeight();
+                  Registry<Biome> registry = RegistryAccess.registryAccess().getRegistry(RegistryKey.BIOME);
+
+                  int idx = 0;
+                  for (int lx = 0; lx < 16; lx += 4) {
+                      for (int lz = 0; lz < 16; lz += 4) {
+                          Biome orig = idx < keys.length ? resolveBiome(keys[idx], fallbackRain) : fallbackRain;
+                          idx++;
+                          NamespacedKey origKey = registry.getKey(orig);
+                          String keyPath = origKey != null ? origKey.getKey() : "";
+                          if (keyPath.contains("snow") || keyPath.contains("frozen") || keyPath.contains("ice")) {
+                              orig = fallbackRain;
+                          }
+                          int wx = baseX + lx;
+                          int wz = baseZ + lz;
+                          int startY = Math.max(minY, world.getHighestBlockYAt(wx, wz) - 8);
+                          for (int y = startY; y < maxY; y += 4) {
+                              world.setBiome(wx, y, wz, orig);
+                          }
+                      }
+                  }
+                  world.refreshChunk(chunk.getX(), chunk.getZ());
+              }
+
+              private void restoreOriginalBiomesWithoutRemove(Chunk chunk) {
+                  PersistentDataContainer pdc = chunk.getPersistentDataContainer();
+                  String saved = pdc.get(origBiomesKey, PersistentDataType.STRING);
+                  if (saved == null || saved.isEmpty()) return;
+
+                  String[] keys = saved.split(",");
+                  World world = chunk.getWorld();
+                  int baseX = chunk.getX() << 4;
+                  int baseZ = chunk.getZ() << 4;
+                  int maxY = world.getMaxHeight();
+                  int minY = world.getMinHeight();
+
+                  int idx = 0;
+                  for (int lx = 0; lx < 16; lx += 4) {
+                      for (int lz = 0; lz < 16; lz += 4) {
+                          if (idx >= keys.length) break;
+                          Biome orig = resolveBiome(keys[idx++], Biome.PLAINS);
+                          int wx = baseX + lx;
+                          int wz = baseZ + lz;
+                          int startY = Math.max(minY, world.getHighestBlockYAt(wx, wz) - 8);
+                          for (int y = startY; y < maxY; y += 4) {
+                              world.setBiome(wx, y, wz, orig);
+                          }
+                      }
+                  }
+                  world.refreshChunk(chunk.getX(), chunk.getZ());
+              }
+
+              public void restoreOriginalBiomes(Chunk chunk) {
+                  restoreOriginalBiomesWithoutRemove(chunk);
+                  chunk.getPersistentDataContainer().remove(origBiomesKey);
+              }
+
+              public void updatePlayersInChunk(Chunk chunk) {
+                  for (Player player : chunk.getWorld().getPlayers()) {
+                      if (player.getLocation().getChunk().equals(chunk)) {
+                          updatePlayerWeather(player, chunk);
+                      }
+                  }
+              }
+
+              public void updatePlayerWeather(Player player, Chunk chunk) {
+                  if (!isManagedChunk(chunk)) {
+                      if (player.getPlayerWeather() != null) {
+                          player.resetPlayerWeather();
+                      }
+                      return;
+                  }
+
+                  WeatherMode mode = getChunkMode(chunk);
+                  if (mode == WeatherMode.CLEAR && chunk.getWorld().hasStorm()) {
+                      player.setPlayerWeather(WeatherType.CLEAR);
+                  } else {
+                      if (player.getPlayerWeather() != null) {
+                          player.resetPlayerWeather();
+                      }
+                  }
+              }
+
+              public void resetAllPlayerWeather() {
+                  for (Player player : Bukkit.getOnlinePlayers()) {
+                      if (player.getPlayerWeather() != null) {
+                          player.resetPlayerWeather();
+                      }
+                  }
+              }
+
+              private Biome resolveBiome(String keyString, Biome defaultBiome) {
+                  if (keyString == null) return defaultBiome;
+                  NamespacedKey key = NamespacedKey.fromString(keyString.toLowerCase());
+                  if (key == null) return defaultBiome;
+                  Biome biome = RegistryAccess.registryAccess().getRegistry(RegistryKey.BIOME).get(key);
+                  return biome != null ? biome : defaultBiome;
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/me/example/snowchunks/WeatherListener.java
+          package me.example.snowchunks;
+
+          import net.kyori.adventure.text.Component;
+          import net.kyori.adventure.text.format.NamedTextColor;
+          import org.bukkit.Chunk;
+          import org.bukkit.Material;
+          import org.bukkit.entity.Player;
+          import org.bukkit.event.EventHandler;
+          import org.bukkit.event.EventPriority;
+          import org.bukkit.event.Listener;
+          import org.bukkit.event.block.Action;
+          import org.bukkit.event.block.BlockFormEvent;
+          import org.bukkit.event.player.PlayerInteractEvent;
+          import org.bukkit.event.player.PlayerJoinEvent;
+          import org.bukkit.event.player.PlayerMoveEvent;
+          import org.bukkit.event.player.PlayerTeleportEvent;
+          import org.bukkit.event.weather.WeatherChangeEvent;
+          import org.bukkit.event.world.ChunkLoadEvent;
+          import org.bukkit.inventory.EquipmentSlot;
+          import org.bukkit.inventory.ItemStack;
+          import org.bukkit.persistence.PersistentDataType;
+
+          public class WeatherListener implements Listener {
+
+              private final SnowChunksPlugin plugin;
+              private final ChunkWeatherManager manager;
+
+              public WeatherListener(SnowChunksPlugin plugin, ChunkWeatherManager manager) {
+                  this.plugin = plugin;
+                  this.manager = manager;
+              }
+
+              @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+              public void onWeatherChange(WeatherChangeEvent event) {
+                  if (event.toWeatherState()) {
+                      plugin.getServer().getScheduler().runTask(plugin, () -> {
+                          WeatherMode rolled = manager.rollWeatherForAllChunks();
+                          plugin.getLogger().info("Погода изменилась! Выпавший режим для выбранных чанков: " + rolled.name());
+                      });
+                  } else {
+                      plugin.getServer().getScheduler().runTask(plugin, () -> {
+                          for (Player player : event.getWorld().getPlayers()) {
+                              manager.updatePlayerWeather(player, player.getLocation().getChunk());
+                          }
+                      });
+                  }
+              }
+
+              @EventHandler
+              public void onChunkLoad(ChunkLoadEvent event) {
+                  Chunk chunk = event.getChunk();
+                  if (manager.isManagedChunk(chunk)) {
+                      manager.applyChunkBiomeForMode(chunk, manager.getChunkMode(chunk));
+                  }
+              }
+
+              @EventHandler(ignoreCancelled = true)
+              public void onBlockForm(BlockFormEvent event) {
+                  Chunk chunk = event.getBlock().getChunk();
+                  if (!manager.isManagedChunk(chunk)) {
+                      return;
+                  }
+
+                  Material newType = event.getNewState().getType();
+                  if (newType == Material.SNOW && !plugin.getConfig().getBoolean("accumulation.allow-snow-layers", true)) {
+                      event.setCancelled(true);
+                  } else if (newType == Material.ICE && !plugin.getConfig().getBoolean("accumulation.allow-ice-form", false)) {
+                      event.setCancelled(true);
+                  }
+              }
+
+              @EventHandler(ignoreCancelled = true)
+              public void onPlayerMove(PlayerMoveEvent event) {
+                  if (event.getFrom().getBlockX() >> 4 == event.getTo().getBlockX() >> 4
+                          && event.getFrom().getBlockZ() >> 4 == event.getTo().getBlockZ() >> 4) {
+                      return;
+                  }
+                  manager.updatePlayerWeather(event.getPlayer(), event.getTo().getChunk());
+              }
+
+              @EventHandler(ignoreCancelled = true)
+              public void onPlayerTeleport(PlayerTeleportEvent event) {
+                  manager.updatePlayerWeather(event.getPlayer(), event.getTo().getChunk());
+              }
+
+              @EventHandler
+              public void onPlayerJoin(PlayerJoinEvent event) {
+                  manager.updatePlayerWeather(event.getPlayer(), event.getPlayer().getLocation().getChunk());
+              }
+
+              @EventHandler
+              public void onWandInteract(PlayerInteractEvent event) {
+                  if (event.getHand() != EquipmentSlot.HAND) return;
+                  ItemStack item = event.getItem();
+                  if (item == null || !item.hasItemMeta()) return;
+
+                  if (!item.getItemMeta().getPersistentDataContainer().has(manager.getWandKey(), PersistentDataType.BYTE)) {
+                      return;
+                  }
+
+                  Player player = event.getPlayer();
+                  if (!player.hasPermission("snowchunks.admin")) return;
+
+                  event.setCancelled(true);
+                  Chunk targetChunk = event.getClickedBlock() != null
+                          ? event.getClickedBlock().getChunk()
+                          : player.getLocation().getChunk();
+
+                  Action action = event.getAction();
+                  if (action == Action.RIGHT_CLICK_BLOCK || action == Action.RIGHT_CLICK_AIR) {
+                      if (manager.addChunk(targetChunk)) {
+                          player.sendMessage(Component.text("Чанк [" + targetChunk.getX() + ", " + targetChunk.getZ() + "] добавлен в снежную зону!", NamedTextColor.AQUA));
+                      } else {
+                          player.sendMessage(Component.text("Этот чанк уже в списке!", NamedTextColor.YELLOW));
+                      }
+                  } else if (action == Action.LEFT_CLICK_BLOCK || action == Action.LEFT_CLICK_AIR) {
+                      if (manager.removeChunk(targetChunk)) {
+                          player.sendMessage(Component.text("Чанк [" + targetChunk.getX() + ", " + targetChunk.getZ() + "] удалён, биом восстановлен.", NamedTextColor.GREEN));
+                      } else {
+                          player.sendMessage(Component.text("Этот чанк не числится в списке снежных.", NamedTextColor.RED));
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/me/example/snowchunks/SnowCommand.java
+          package me.example.snowchunks;
+
+          import net.kyori.adventure.text.Component;
+          import net.kyori.adventure.text.format.NamedTextColor;
+          import org.bukkit.Chunk;
+          import org.bukkit.Material;
+          import org.bukkit.World;
+          import org.bukkit.command.Command;
+          import org.bukkit.command.CommandExecutor;
+          import org.bukkit.command.CommandSender;
+          import org.bukkit.command.TabCompleter;
+          import org.bukkit.entity.Player;
+          import org.bukkit.inventory.ItemStack;
+          import org.bukkit.inventory.meta.ItemMeta;
+          import org.bukkit.persistence.PersistentDataType;
+
+          import java.util.Arrays;
+          import java.util.Collections;
+          import java.util.List;
+
+          public class SnowCommand implements CommandExecutor, TabCompleter {
+
+              private final SnowChunksPlugin plugin;
+              private final ChunkWeatherManager manager;
+
+              public SnowCommand(SnowChunksPlugin plugin, ChunkWeatherManager manager) {
+                  this.plugin = plugin;
+                  this.manager = manager;
+              }
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                  if (args.length == 0) {
+                      sendHelp(sender);
+                      return true;
+                  }
+
+                  String sub = args[0].toLowerCase();
+
+                  switch (sub) {
+                      case "add" -> {
+                          if (!(sender instanceof Player player)) {
+                              sender.sendMessage(Component.text("Команда только для игроков.", NamedTextColor.RED));
+                              return true;
+                          }
+                          Chunk chunk = player.getLocation().getChunk();
+                          if (manager.addChunk(chunk)) {
+                              player.sendMessage(Component.text("Чанк [" + chunk.getX() + ", " + chunk.getZ() + "] добавлен!", NamedTextColor.AQUA));
+                          } else {
+                              player.sendMessage(Component.text("Этот чанк уже добавлен.", NamedTextColor.YELLOW));
+                          }
+                      }
+                      case "remove" -> {
+                          if (!(sender instanceof Player player)) {
+                              sender.sendMessage(Component.text("Команда только для игроков.", NamedTextColor.RED));
+                              return true;
+                          }
+                          Chunk chunk = player.getLocation().getChunk();
+                          if (manager.removeChunk(chunk)) {
+                              player.sendMessage(Component.text("Чанк [" + chunk.getX() + ", " + chunk.getZ() + "] удалён, оригинальный биом возвращён.", NamedTextColor.GREEN));
+                          } else {
+                              player.sendMessage(Component.text("Этот чанк не найден в списке.", NamedTextColor.RED));
+                          }
+                      }
+                      case "addradius" -> {
+                          if (!(sender instanceof Player player)) return true;
+                          if (args.length < 2) {
+                              player.sendMessage(Component.text("Использование: /sc addradius <радиус_в_чанках>", NamedTextColor.RED));
+                              return true;
+                          }
+                          int radius = parseRadius(args[1], player);
+                          if (radius < 0) return true;
+
+                          World world = player.getWorld();
+                          int centerX = player.getLocation().getChunk().getX();
+                          int centerZ = player.getLocation().getChunk().getZ();
+                          int added = 0;
+
+                          for (int dx = -radius; dx <= radius; dx++) {
+                              for (int dz = -radius; dz <= radius; dz++) {
+                                  if (manager.addChunk(world.getChunkAt(centerX + dx, centerZ + dz))) {
+                                      added++;
+                                  }
+                              }
+                          }
+                          player.sendMessage(Component.text("Добавлено чанков: " + added, NamedTextColor.AQUA));
+                      }
+                      case "removeradius" -> {
+                          if (!(sender instanceof Player player)) return true;
+                          if (args.length < 2) {
+                              player.sendMessage(Component.text("Использование: /sc removeradius <радиус_в_чанках>", NamedTextColor.RED));
+                              return true;
+                          }
+                          int radius = parseRadius(args[1], player);
+                          if (radius < 0) return true;
+
+                          World world = player.getWorld();
+                          int centerX = player.getLocation().getChunk().getX();
+                          int centerZ = player.getLocation().getChunk().getZ();
+                          int removed = 0;
+
+                          for (int dx = -radius; dx <= radius; dx++) {
+                              for (int dz = -radius; dz <= radius; dz++) {
+                                  if (manager.removeChunk(world.getChunkAt(centerX + dx, centerZ + dz))) {
+                                      removed++;
+                                  }
+                              }
+                          }
+                          player.sendMessage(Component.text("Удалено и восстановлено чанков: " + removed, NamedTextColor.GREEN));
+                      }
+                      case "wand" -> {
+                          if (!(sender instanceof Player player)) return true;
+                          ItemStack wand = new ItemStack(Material.BLAZE_ROD);
+                          ItemMeta meta = wand.getItemMeta();
+                          meta.displayName(Component.text("Жезл снежных чанков", NamedTextColor.AQUA));
+                          meta.lore(List.of(
+                                  Component.text("ПКМ — добавить чанк", NamedTextColor.GRAY),
+                                  Component.text("ЛКМ — удалить чанк", NamedTextColor.GRAY)
+                          ));
+                          meta.getPersistentDataContainer().set(manager.getWandKey(), PersistentDataType.BYTE, (byte) 1);
+                          wand.setItemMeta(meta);
+                          player.getInventory().addItem(wand);
+                          player.sendMessage(Component.text("Выдан жезл выделения чанков!", NamedTextColor.AQUA));
+                      }
+                      case "roll" -> {
+                          WeatherMode mode = manager.rollWeatherForAllChunks();
+                          sender.sendMessage(Component.text("Вероятности переброшены! Текущий режим: " + mode.name(), NamedTextColor.AQUA));
+                      }
+                      case "force" -> {
+                          if (args.length < 2) {
+                              sender.sendMessage(Component.text("Использование: /sc force <snow|rain|thunder|clear>", NamedTextColor.RED));
+                              return true;
+                          }
+                          try {
+                              WeatherMode mode = WeatherMode.valueOf(args[1].toUpperCase());
+                              manager.forceWeatherMode(mode);
+                              sender.sendMessage(Component.text("Принудительно установлен режим осадков: " + mode.name(), NamedTextColor.GREEN));
+                          } catch (IllegalArgumentException e) {
+                              sender.sendMessage(Component.text("Доступные режимы: snow, rain, thunder, clear", NamedTextColor.RED));
+                          }
+                      }
+                      case "setchance" -> {
+                          if (args.length < 3) {
+                              sender.sendMessage(Component.text("Использование: /sc setchance <snow|rain|thunder|clear> <вес>", NamedTextColor.RED));
+                              return true;
+                          }
+                          String type = args[1].toLowerCase();
+                          if (!List.of("snow", "rain", "thunder", "clear").contains(type)) {
+                              sender.sendMessage(Component.text("Неверный тип! Доступны: snow, rain, thunder, clear", NamedTextColor.RED));
+                              return true;
+                          }
+                          try {
+                              double val = Double.parseDouble(args[2]);
+                              plugin.getConfig().set("probabilities." + type, Math.max(0, val));
+                              plugin.saveConfig();
+                              sender.sendMessage(Component.text("Вес вероятности для " + type + " установлен на " + val, NamedTextColor.GREEN));
+                          } catch (NumberFormatException e) {
+                              sender.sendMessage(Component.text("Введите корректное число.", NamedTextColor.RED));
+                          }
+                      }
+                      case "list" -> {
+                          sender.sendMessage(Component.text("Выбранные чанки (" + manager.getSelectedChunks().size() + "): "
+                                  + String.join(", ", manager.getSelectedChunks()), NamedTextColor.AQUA));
+                      }
+                      case "reload" -> {
+                          plugin.reloadConfig();
+                          manager.loadChunksFromConfig();
+                          sender.sendMessage(Component.text("Конфигурация SnowChunks перезагружена!", NamedTextColor.GREEN));
+                      }
+                      default -> sendHelp(sender);
+                  }
+                  return true;
+              }
+
+              private int parseRadius(String arg, Player player) {
+                  try {
+                      int r = Integer.parseInt(arg);
+                      if (r < 0 || r > 10) {
+                          player.sendMessage(Component.text("Радиус должен быть от 0 до 10.", NamedTextColor.RED));
+                          return -1;
+                      }
+                      return r;
+                  } catch (NumberFormatException e) {
+                      player.sendMessage(Component.text("Введите корректное целое число.", NamedTextColor.RED));
+                      return -1;
+                  }
+              }
+
+              private void sendHelp(CommandSender sender) {
+                  sender.sendMessage(Component.text("--- Команды SnowChunks ---", NamedTextColor.AQUA));
+                  sender.sendMessage(Component.text("/sc add / remove — добавить/удалить текущий чанк", NamedTextColor.GRAY));
+                  sender.sendMessage(Component.text("/sc addradius <R> / removeradius <R> — добавить/удалить чанки в радиусе", NamedTextColor.GRAY));
+                  sender.sendMessage(Component.text("/sc wand — получить жезл быстрого выбора чанков", NamedTextColor.GRAY));
+                  sender.sendMessage(Component.text("/sc setchance <snow|rain|thunder|clear> <вес> — настроить шанс осадков", NamedTextColor.GRAY));
+                  sender.sendMessage(Component.text("/sc roll — перебросить случайный тип осадков по шансам", NamedTextColor.GRAY));
+                  sender.sendMessage(Component.text("/sc force <snow|rain|thunder|clear> — принудительно включить осадки", NamedTextColor.GRAY));
+                  sender.sendMessage(Component.text("/sc list / reload — список чанков / перезагрузка конфига", NamedTextColor.GRAY));
+              }
+
+              @Override
+              public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+                  if (args.length == 1) {
+                      return Arrays.asList("add", "remove", "addradius", "removeradius", "wand", "roll", "force", "setchance", "list", "reload");
+                  }
+                  if (args.length == 2 && (args[0].equalsIgnoreCase("force") || args[0].equalsIgnoreCase("setchance"))) {
+                      return Arrays.asList("snow", "rain", "thunder", "clear");
+                  }
+                  return Collections.emptyList();
+              }
+          }
+          EOF
+
+          gradle build --no-daemon
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: SnowChunks-Plugin
-          path: "**/build/libs/*.jar"
+          path: build/libs/*.jar
