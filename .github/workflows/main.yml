@@ -25,7 +25,7 @@ jobs:
           mkdir -p src/main/java/me/example/snowchunks
           mkdir -p src/main/resources
 
-          # Автоматическое определение доступной версии Paper API в репозитории PaperMC
+          # Автоматическое определение доступной версии Paper API
           METADATA=$(curl -s https://repo.papermc.io/repository/maven-public/io/papermc/paper/paper-api/maven-metadata.xml)
           PAPER_VER=$(echo "$METADATA" | grep -oP '(?<=<version>)[^<]+' | grep '^26\.3' | tail -n 1 || true)
           if [ -z "$PAPER_VER" ]; then
@@ -58,7 +58,7 @@ jobs:
           }
 
           group = "me.example"
-          version = "1.0.0"
+          version = "1.2.0"
 
           repositories {
               mavenCentral()
@@ -80,10 +80,10 @@ jobs:
 
           cat << 'EOF' > src/main/resources/plugin.yml
           name: SnowChunks
-          version: '1.0.0'
+          version: '1.2.0'
           main: me.example.snowchunks.SnowChunksPlugin
           api-version: '1.21'
-          description: Замена дождя на снег в выбранных чанках с настройкой вероятностей осадков
+          description: Замена дождя на снег, рост сугробов, авто-таяние и подсветка границ чанков
           commands:
             snowchunks:
               aliases: [sc, snowchunk]
@@ -103,6 +103,30 @@ jobs:
           accumulation:
             allow-snow-layers: true
             allow-ice-form: false
+
+          # Настройки роста глубоких сугробов во время снегопада и метели
+          snowdrifts:
+            enabled: true
+            max-layers: 7              # Максимальная высота сугробов (от 1 до 7 слоёв)
+            interval-ticks: 20         # Частота обновления в тиках (20 тиков = 1 секунда)
+            attempts-per-chunk: 10     # Сколько случайных точек в чанке проверяется за раз
+            growth-chance: 0.45        # Шанс нарастить слой снега при проверке (0.0 - 1.0)
+
+          # Настройки автоматического таяния снега при солнце или дожде
+          melting:
+            enabled: true
+            only-daytime: false        # Если true — при ясной погоде снег тает только днём (под дождём тает всегда)
+            attempts-per-chunk: 12     # Скорость случайного таяния в чанке за интервал
+            melt-chance: 0.55          # Шанс уменьшить сугроб на 1 слой при проверке (0.0 - 1.0)
+
+          # Настройки визуальной подсветки границ чанков, когда жезл (/sc wand) в руке
+          visualizer:
+            enabled: true
+            interval-ticks: 10         # Частота отрисовки частиц (10 тиков = каждые 0.5 сек)
+            chunk-radius: 3            # В каком радиусе чанков вокруг игрока показывать границы (1-6)
+            step-blocks: 2             # Шаг между частицами вдоль линии границы (в блоках)
+            show-inner-grid: true      # Показывать ли внутренние границы между соседними снежными чанками
+            show-actionbar: true       # Показывать ли статус текущего чанка над хотбаром
 
           probabilities:
             snow: 65
@@ -129,10 +153,14 @@ jobs:
 
           import org.bukkit.command.PluginCommand;
           import org.bukkit.plugin.java.JavaPlugin;
+          import org.bukkit.scheduler.BukkitTask;
 
           public final class SnowChunksPlugin extends JavaPlugin {
 
               private ChunkWeatherManager weatherManager;
+              private BukkitTask physicsTask;
+              private BukkitTask visualizerTask;
+              private WandVisualizerTask visualizerRunner;
 
               @Override
               public void onEnable() {
@@ -140,8 +168,9 @@ jobs:
 
                   this.weatherManager = new ChunkWeatherManager(this);
                   this.weatherManager.loadChunksFromConfig();
+                  this.visualizerRunner = new WandVisualizerTask(this, weatherManager);
 
-                  getServer().getPluginManager().registerEvents(new WeatherListener(this, weatherManager), this);
+                  getServer().getPluginManager().registerEvents(new WeatherListener(this, weatherManager, visualizerRunner), this);
 
                   SnowCommand commandExecutor = new SnowCommand(this, weatherManager);
                   PluginCommand cmd = getCommand("snowchunks");
@@ -150,11 +179,35 @@ jobs:
                       cmd.setTabCompleter(commandExecutor);
                   }
 
-                  getLogger().info("SnowChunks успешно запущен!");
+                  startTasks();
+                  getLogger().info("SnowChunks v1.2.0 (сугробы, таяние и подсветка границ) успешно запущен!");
+              }
+
+              public void startTasks() {
+                  if (physicsTask != null) {
+                      physicsTask.cancel();
+                  }
+                  if (visualizerTask != null) {
+                      visualizerTask.cancel();
+                  }
+
+                  long physInterval = Math.max(5L, getConfig().getLong("snowdrifts.interval-ticks", 20L));
+                  SnowPhysicsTask physRunner = new SnowPhysicsTask(this, weatherManager);
+                  this.physicsTask = getServer().getScheduler().runTaskTimer(this, physRunner, physInterval, physInterval);
+
+                  long visInterval = Math.max(4L, getConfig().getLong("visualizer.interval-ticks", 10L));
+                  this.visualizerRunner = new WandVisualizerTask(this, weatherManager);
+                  this.visualizerTask = getServer().getScheduler().runTaskTimer(this, visualizerRunner, visInterval, visInterval);
               }
 
               @Override
               public void onDisable() {
+                  if (physicsTask != null) {
+                      physicsTask.cancel();
+                  }
+                  if (visualizerTask != null) {
+                      visualizerTask.cancel();
+                  }
                   if (weatherManager != null) {
                       weatherManager.resetAllPlayerWeather();
                   }
@@ -162,6 +215,10 @@ jobs:
 
               public ChunkWeatherManager getWeatherManager() {
                   return weatherManager;
+              }
+
+              public WandVisualizerTask getVisualizerRunner() {
+                  return visualizerRunner;
               }
           }
           EOF
@@ -173,13 +230,17 @@ jobs:
           import io.papermc.paper.registry.RegistryKey;
           import org.bukkit.Bukkit;
           import org.bukkit.Chunk;
+          import org.bukkit.HeightMap;
+          import org.bukkit.Material;
           import org.bukkit.NamespacedKey;
           import org.bukkit.Registry;
           import org.bukkit.WeatherType;
           import org.bukkit.World;
           import org.bukkit.block.Biome;
+          import org.bukkit.block.Block;
           import org.bukkit.configuration.ConfigurationSection;
           import org.bukkit.entity.Player;
+          import org.bukkit.inventory.ItemStack;
           import org.bukkit.persistence.PersistentDataContainer;
           import org.bukkit.persistence.PersistentDataType;
 
@@ -201,6 +262,7 @@ jobs:
               private final Set<String> selectedChunks = new HashSet<>();
               private final Map<String, WeatherMode> chunkModes = new HashMap<>();
               private WeatherMode globalRolledMode = WeatherMode.SNOW;
+              private long stormSeed = ThreadLocalRandom.current().nextLong();
 
               public ChunkWeatherManager(SnowChunksPlugin plugin) {
                   this.plugin = plugin;
@@ -210,6 +272,20 @@ jobs:
 
               public NamespacedKey getWandKey() {
                   return wandKey;
+              }
+
+              public long getStormSeed() {
+                  return stormSeed;
+              }
+
+              public boolean isWandItem(ItemStack item) {
+                  if (item == null || !item.hasItemMeta()) return false;
+                  return item.getItemMeta().getPersistentDataContainer().has(wandKey, PersistentDataType.BYTE);
+              }
+
+              public boolean isHoldingWand(Player player) {
+                  return isWandItem(player.getInventory().getItemInMainHand())
+                          || isWandItem(player.getInventory().getItemInOffHand());
               }
 
               public String toKey(World world, int chunkX, int chunkZ) {
@@ -235,6 +311,10 @@ jobs:
 
               public boolean isManagedChunk(Chunk chunk) {
                   return selectedChunks.contains(toKey(chunk));
+              }
+
+              public boolean isManagedChunk(World world, int chunkX, int chunkZ) {
+                  return selectedChunks.contains(toKey(world, chunkX, chunkZ));
               }
 
               public Set<String> getSelectedChunks() {
@@ -300,7 +380,8 @@ jobs:
               }
 
               public WeatherMode rollWeatherForAllChunks() {
-                  globalRolledMode = rollSingleProbability();
+                  this.stormSeed = ThreadLocalRandom.current().nextLong();
+                  this.globalRolledMode = rollSingleProbability();
                   chunkModes.clear();
 
                   for (String key : selectedChunks) {
@@ -314,11 +395,58 @@ jobs:
               }
 
               public void forceWeatherMode(WeatherMode mode) {
+                  this.stormSeed = ThreadLocalRandom.current().nextLong();
                   this.globalRolledMode = mode;
                   for (String key : selectedChunks) {
                       chunkModes.put(key, mode);
                       applyToLoadedChunkKey(key, mode);
                   }
+              }
+
+              public int clearSnowInManagedChunks() {
+                  int clearedBlocks = 0;
+                  for (String key : selectedChunks) {
+                      String[] parts = key.split(":");
+                      if (parts.length != 3) continue;
+                      World world = Bukkit.getWorld(parts[0]);
+                      if (world == null) continue;
+                      try {
+                          int cx = Integer.parseInt(parts[1]);
+                          int cz = Integer.parseInt(parts[2]);
+                          if (!world.isChunkLoaded(cx, cz)) continue;
+                          int baseX = cx << 4;
+                          int baseZ = cz << 4;
+                          for (int lx = 0; lx < 16; lx++) {
+                              for (int lz = 0; lz < 16; lz++) {
+                                  Block snow = findSurfaceSnowBlock(world, baseX + lx, baseZ + lz);
+                                  if (snow != null) {
+                                      snow.setType(Material.AIR, true);
+                                      clearedBlocks++;
+                                  }
+                              }
+                          }
+                      } catch (NumberFormatException ignored) {
+                      }
+                  }
+                  return clearedBlocks;
+              }
+
+              public Block findSurfaceSnowBlock(World world, int wx, int wz) {
+                  int ySurface = world.getHighestBlockYAt(wx, wz, HeightMap.WORLD_SURFACE);
+                  Block b1 = world.getBlockAt(wx, ySurface, wz);
+                  if (b1.getType() == Material.SNOW) {
+                      return b1;
+                  }
+                  int yMotion = world.getHighestBlockYAt(wx, wz, HeightMap.MOTION_BLOCKING);
+                  Block b2 = world.getBlockAt(wx, yMotion, wz);
+                  if (b2.getType() == Material.SNOW) {
+                      return b2;
+                  }
+                  Block b3 = b2.getRelative(0, 1, 0);
+                  if (b3.getType() == Material.SNOW) {
+                      return b3;
+                  }
+                  return null;
               }
 
               private void applyToLoadedChunkKey(String key, WeatherMode mode) {
@@ -519,6 +647,350 @@ jobs:
           }
           EOF
 
+          cat << 'EOF' > src/main/java/me/example/snowchunks/WandVisualizerTask.java
+          package me.example.snowchunks;
+
+          import net.kyori.adventure.text.Component;
+          import net.kyori.adventure.text.format.NamedTextColor;
+          import org.bukkit.Bukkit;
+          import org.bukkit.Chunk;
+          import org.bukkit.HeightMap;
+          import org.bukkit.Particle;
+          import org.bukkit.World;
+          import org.bukkit.entity.Player;
+
+          public class WandVisualizerTask implements Runnable {
+
+              private final SnowChunksPlugin plugin;
+              private final ChunkWeatherManager manager;
+
+              public WandVisualizerTask(SnowChunksPlugin plugin, ChunkWeatherManager manager) {
+                  this.plugin = plugin;
+                  this.manager = manager;
+              }
+
+              @Override
+              public void run() {
+                  if (!plugin.getConfig().getBoolean("visualizer.enabled", true)) {
+                      return;
+                  }
+
+                  int radius = Math.max(1, Math.min(6, plugin.getConfig().getInt("visualizer.chunk-radius", 3)));
+                  int step = Math.max(1, Math.min(8, plugin.getConfig().getInt("visualizer.step-blocks", 2)));
+                  boolean showInnerGrid = plugin.getConfig().getBoolean("visualizer.show-inner-grid", true);
+                  boolean showActionbar = plugin.getConfig().getBoolean("visualizer.show-actionbar", true);
+
+                  for (Player player : Bukkit.getOnlinePlayers()) {
+                      if (!player.hasPermission("snowchunks.admin")) continue;
+                      if (!manager.isHoldingWand(player)) continue;
+
+                      World world = player.getWorld();
+                      Chunk playerChunk = player.getLocation().getChunk();
+                      int centerX = playerChunk.getX();
+                      int centerZ = playerChunk.getZ();
+
+                      if (showActionbar) {
+                          sendChunkStatusActionBar(player, playerChunk);
+                      }
+
+                      for (int dx = -radius; dx <= radius; dx++) {
+                          for (int dz = -radius; dz <= radius; dz++) {
+                              int cx = centerX + dx;
+                              int cz = centerZ + dz;
+                              if (!manager.isManagedChunk(world, cx, cz)) continue;
+                              if (!world.isChunkLoaded(cx, cz)) continue;
+
+                              renderChunkBorders(player, world, cx, cz, step, showInnerGrid);
+                          }
+                      }
+                  }
+              }
+
+              private void sendChunkStatusActionBar(Player player, Chunk chunk) {
+                  boolean managed = manager.isManagedChunk(chunk);
+                  if (managed) {
+                      WeatherMode mode = manager.getChunkMode(chunk);
+                      player.sendActionBar(
+                              Component.text("Чанк [" + chunk.getX() + ", " + chunk.getZ() + "]: ", NamedTextColor.GRAY)
+                                      .append(Component.text("❄ Снежная зона ", NamedTextColor.AQUA))
+                                      .append(Component.text("(Режим: " + mode.name() + " | ЛКМ — удалить)", NamedTextColor.WHITE))
+                      );
+                  } else {
+                      player.sendActionBar(
+                              Component.text("Чанк [" + chunk.getX() + ", " + chunk.getZ() + "]: ", NamedTextColor.GRAY)
+                                      .append(Component.text("Обычная зона ", NamedTextColor.YELLOW))
+                                      .append(Component.text("(ПКМ — сделать снежной)", NamedTextColor.WHITE))
+                      );
+                  }
+              }
+
+              private void renderChunkBorders(Player player, World world, int cx, int cz, int step, boolean showInnerGrid) {
+                  int minX = cx << 4;
+                  int minZ = cz << 4;
+                  int maxX = minX + 16;
+                  int maxZ = minZ + 16;
+
+                  boolean northManaged = manager.isManagedChunk(world, cx, cz - 1);
+                  boolean southManaged = manager.isManagedChunk(world, cx, cz + 1);
+                  boolean westManaged = manager.isManagedChunk(world, cx - 1, cz);
+                  boolean eastManaged = manager.isManagedChunk(world, cx + 1, cz);
+
+                  // Северная грань (minZ)
+                  if (!northManaged || showInnerGrid) {
+                      for (int x = minX; x <= maxX; x += step) {
+                          spawnBorderPoint(player, world, x, minZ, !northManaged);
+                      }
+                  }
+                  // Южная грань (maxZ) — для внутренних граней рисуем только с одной стороны, чтобы не дублировать
+                  if (!southManaged) {
+                      for (int x = minX; x <= maxX; x += step) {
+                          spawnBorderPoint(player, world, x, maxZ, true);
+                      }
+                  }
+                  // Западная грань (minX)
+                  if (!westManaged || showInnerGrid) {
+                      for (int z = minZ; z <= maxZ; z += step) {
+                          spawnBorderPoint(player, world, minX, z, !westManaged);
+                      }
+                  }
+                  // Восточная грань (maxX)
+                  if (!eastManaged) {
+                      for (int z = minZ; z <= maxZ; z += step) {
+                          spawnBorderPoint(player, world, maxX, z, true);
+                      }
+                  }
+              }
+
+              private void spawnBorderPoint(Player player, World world, double wx, double wz, boolean isOuterBorder) {
+                  int blockX = (int) Math.floor(wx);
+                  int blockZ = (int) Math.floor(wz);
+                  int surfaceY = world.getHighestBlockYAt(blockX, blockZ, HeightMap.WORLD_SURFACE);
+                  double baseY = surfaceY + 1.15;
+                  double playerEyeY = player.getLocation().getY() + 1.0;
+
+                  if (isOuterBorder) {
+                      // Внешний периметр снежной зоны: высокая заметная стенка из частиц
+                      player.spawnParticle(Particle.END_ROD, wx, baseY, wz, 1, 0, 0, 0, 0);
+                      player.spawnParticle(Particle.SNOWFLAKE, wx, baseY + 1.0, wz, 1, 0.05, 0.05, 0.05, 0);
+                      player.spawnParticle(Particle.END_ROD, wx, baseY + 2.0, wz, 1, 0, 0, 0, 0);
+
+                      // Если администратор летит высоко над землёй, дублируем линию на высоте его глаз
+                      if (Math.abs(playerEyeY - baseY) > 6.0) {
+                          player.spawnParticle(Particle.END_ROD, wx, playerEyeY, wz, 1, 0, 0, 0, 0);
+                      }
+                  } else {
+                      // Внутренняя сетка между соседними снежными чанками: аккуратный пунктир
+                      player.spawnParticle(Particle.SNOWFLAKE, wx, baseY, wz, 1, 0, 0, 0, 0);
+                      if (Math.abs(playerEyeY - baseY) > 6.0) {
+                          player.spawnParticle(Particle.SNOWFLAKE, wx, playerEyeY, wz, 1, 0, 0, 0, 0);
+                      }
+                  }
+              }
+
+              /**
+               * Мгновенная вспышка по контуру чанка при добавлении или удалении жезлом
+               */
+              public void spawnInstantChunkFeedback(Player player, Chunk chunk, boolean added) {
+                  World world = chunk.getWorld();
+                  int minX = chunk.getX() << 4;
+                  int minZ = chunk.getZ() << 4;
+                  int maxX = minX + 16;
+                  int maxZ = minZ + 16;
+                  Particle feedbackParticle = added ? Particle.END_ROD : Particle.CLOUD;
+
+                  for (int i = 0; i <= 16; i += 2) {
+                      spawnFeedbackColumn(player, world, minX + i, minZ, feedbackParticle);
+                      spawnFeedbackColumn(player, world, minX + i, maxZ, feedbackParticle);
+                      spawnFeedbackColumn(player, world, minX, minZ + i, feedbackParticle);
+                      spawnFeedbackColumn(player, world, maxX, minZ + i, feedbackParticle);
+                  }
+              }
+
+              private void spawnFeedbackColumn(Player player, World world, double wx, double wz, Particle particle) {
+                  int surfaceY = world.getHighestBlockYAt((int) wx, (int) wz, HeightMap.WORLD_SURFACE);
+                  double baseY = surfaceY + 1.2;
+                  player.spawnParticle(particle, wx, baseY, wz, 2, 0.05, 0.3, 0.05, 0.01);
+                  player.spawnParticle(particle, wx, baseY + 1.5, wz, 2, 0.05, 0.3, 0.05, 0.01);
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/me/example/snowchunks/SnowPhysicsTask.java
+          package me.example.snowchunks;
+
+          import org.bukkit.Bukkit;
+          import org.bukkit.Chunk;
+          import org.bukkit.HeightMap;
+          import org.bukkit.Material;
+          import org.bukkit.World;
+          import org.bukkit.block.Block;
+          import org.bukkit.block.data.BlockData;
+          import org.bukkit.block.data.type.Snow;
+
+          import java.util.concurrent.ThreadLocalRandom;
+
+          public class SnowPhysicsTask implements Runnable {
+
+              private final SnowChunksPlugin plugin;
+              private final ChunkWeatherManager manager;
+              private int sweepSlice = 0;
+
+              public SnowPhysicsTask(SnowChunksPlugin plugin, ChunkWeatherManager manager) {
+                  this.plugin = plugin;
+                  this.manager = manager;
+              }
+
+              @Override
+              public void run() {
+                  sweepSlice = (sweepSlice + 1) & 15;
+
+                  boolean driftsEnabled = plugin.getConfig().getBoolean("snowdrifts.enabled", true);
+                  boolean allowSnowLayers = plugin.getConfig().getBoolean("accumulation.allow-snow-layers", true);
+                  int maxLayers = Math.max(1, Math.min(7, plugin.getConfig().getInt("snowdrifts.max-layers", 7)));
+                  int driftAttempts = Math.max(1, plugin.getConfig().getInt("snowdrifts.attempts-per-chunk", 10));
+                  double growthChance = plugin.getConfig().getDouble("snowdrifts.growth-chance", 0.45);
+
+                  boolean meltingEnabled = plugin.getConfig().getBoolean("melting.enabled", true);
+                  boolean onlyDaytime = plugin.getConfig().getBoolean("melting.only-daytime", false);
+                  int meltAttempts = Math.max(1, plugin.getConfig().getInt("melting.attempts-per-chunk", 12));
+                  double meltChance = plugin.getConfig().getDouble("melting.melt-chance", 0.55);
+
+                  for (String key : manager.getSelectedChunks()) {
+                      String[] parts = key.split(":");
+                      if (parts.length != 3) continue;
+
+                      World world = Bukkit.getWorld(parts[0]);
+                      if (world == null) continue;
+
+                      int cx;
+                      int cz;
+                      try {
+                          cx = Integer.parseInt(parts[1]);
+                          cz = Integer.parseInt(parts[2]);
+                      } catch (NumberFormatException e) {
+                          continue;
+                      }
+
+                      if (!world.isChunkLoaded(cx, cz)) continue;
+                      Chunk chunk = world.getChunkAt(cx, cz);
+                      WeatherMode mode = manager.getChunkMode(chunk);
+
+                      boolean isSnowingInChunk = world.hasStorm()
+                              && (mode == WeatherMode.SNOW || mode == WeatherMode.THUNDER);
+
+                      if (isSnowingInChunk) {
+                          if (driftsEnabled && allowSnowLayers) {
+                              int effectiveAttempts = (mode == WeatherMode.THUNDER) ? driftAttempts * 2 : driftAttempts;
+                              growSnowdriftsInChunk(world, cx, cz, maxLayers, effectiveAttempts, growthChance);
+                          }
+                      } else {
+                          if (meltingEnabled) {
+                              boolean isRainingInChunk = world.hasStorm() && mode == WeatherMode.RAIN;
+                              if (onlyDaytime && !isRainingInChunk && !world.isDayTime()) {
+                                  continue;
+                              }
+                              double effectiveMeltChance = isRainingInChunk ? Math.min(1.0, meltChance * 1.5) : meltChance;
+                              meltSnowInChunk(world, cx, cz, meltAttempts, effectiveMeltChance);
+                          }
+                      }
+                  }
+              }
+
+              private void growSnowdriftsInChunk(World world, int cx, int cz, int configuredMaxLayers, int attempts, double chance) {
+                  ThreadLocalRandom random = ThreadLocalRandom.current();
+                  int baseX = cx << 4;
+                  int baseZ = cz << 4;
+
+                  for (int i = 0; i < attempts; i++) {
+                      if (random.nextDouble() > chance) continue;
+
+                      int wx = baseX + random.nextInt(16);
+                      int wz = baseZ + random.nextInt(16);
+
+                      int targetMaxLayers = getRandomMaxLayersForColumn(wx, wz, configuredMaxLayers);
+
+                      Block snowBlock = manager.findSurfaceSnowBlock(world, wx, wz);
+                      if (snowBlock != null) {
+                          if (snowBlock.getLightFromBlocks() > 11) continue;
+                          if (snowBlock.getBlockData() instanceof Snow snowData) {
+                              int current = snowData.getLayers();
+                              int limit = Math.min(targetMaxLayers, Math.min(7, snowData.getMaximumLayers()));
+                              if (current < limit) {
+                                  snowData.setLayers(current + 1);
+                                  snowBlock.setBlockData(snowData, true);
+                              }
+                          }
+                      } else {
+                          int yMotion = world.getHighestBlockYAt(wx, wz, HeightMap.MOTION_BLOCKING);
+                          Block ground = world.getBlockAt(wx, yMotion, wz);
+                          if (!ground.getType().isSolid() || ground.isLiquid()) continue;
+
+                          Block above = ground.getRelative(0, 1, 0);
+                          if (above.getType() == Material.AIR && above.getLightFromBlocks() <= 11) {
+                              BlockData newSnow = Bukkit.createBlockData(Material.SNOW);
+                              if (above.canPlace(newSnow)) {
+                                  above.setBlockData(newSnow, true);
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private void meltSnowInChunk(World world, int cx, int cz, int attempts, double chance) {
+                  ThreadLocalRandom random = ThreadLocalRandom.current();
+                  int baseX = cx << 4;
+                  int baseZ = cz << 4;
+                  int meltedCount = 0;
+
+                  for (int i = 0; i < attempts; i++) {
+                      if (random.nextDouble() > chance) continue;
+                      int wx = baseX + random.nextInt(16);
+                      int wz = baseZ + random.nextInt(16);
+
+                      if (meltSingleColumn(world, wx, wz)) {
+                          meltedCount++;
+                      }
+                  }
+
+                  if (meltedCount == 0 && random.nextDouble() <= chance) {
+                      int wx = baseX + sweepSlice;
+                      for (int lz = 0; lz < 16; lz++) {
+                          if (meltSingleColumn(world, wx, baseZ + lz)) {
+                              break;
+                          }
+                      }
+                  }
+              }
+
+              private boolean meltSingleColumn(World world, int wx, int wz) {
+                  Block snowBlock = manager.findSurfaceSnowBlock(world, wx, wz);
+                  if (snowBlock == null) return false;
+
+                  if (snowBlock.getBlockData() instanceof Snow snowData) {
+                      int current = snowData.getLayers();
+                      if (current > 1) {
+                          snowData.setLayers(current - 1);
+                          snowBlock.setBlockData(snowData, true);
+                      } else {
+                          snowBlock.setType(Material.AIR, true);
+                      }
+                  } else {
+                      snowBlock.setType(Material.AIR, true);
+                  }
+                  return true;
+              }
+
+              private int getRandomMaxLayersForColumn(int wx, int wz, int maxLayers) {
+                  if (maxLayers <= 1) return 1;
+                  long h = manager.getStormSeed() ^ (wx * 374761393L) ^ (wz * 668265263L);
+                  h = (h ^ (h >> 13)) * 1274126177L;
+                  h = h ^ (h >> 16);
+                  int positive = (int) (h & 0x7FFFFFFF);
+                  return 1 + (positive % maxLayers);
+              }
+          }
+          EOF
+
           cat << 'EOF' > src/main/java/me/example/snowchunks/WeatherListener.java
           package me.example.snowchunks;
 
@@ -540,16 +1012,17 @@ jobs:
           import org.bukkit.event.world.ChunkLoadEvent;
           import org.bukkit.inventory.EquipmentSlot;
           import org.bukkit.inventory.ItemStack;
-          import org.bukkit.persistence.PersistentDataType;
 
           public class WeatherListener implements Listener {
 
               private final SnowChunksPlugin plugin;
               private final ChunkWeatherManager manager;
+              private final WandVisualizerTask visualizer;
 
-              public WeatherListener(SnowChunksPlugin plugin, ChunkWeatherManager manager) {
+              public WeatherListener(SnowChunksPlugin plugin, ChunkWeatherManager manager, WandVisualizerTask visualizer) {
                   this.plugin = plugin;
                   this.manager = manager;
+                  this.visualizer = visualizer;
               }
 
               @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -614,9 +1087,7 @@ jobs:
               public void onWandInteract(PlayerInteractEvent event) {
                   if (event.getHand() != EquipmentSlot.HAND) return;
                   ItemStack item = event.getItem();
-                  if (item == null || !item.hasItemMeta()) return;
-
-                  if (!item.getItemMeta().getPersistentDataContainer().has(manager.getWandKey(), PersistentDataType.BYTE)) {
+                  if (!manager.isWandItem(item)) {
                       return;
                   }
 
@@ -631,12 +1102,14 @@ jobs:
                   Action action = event.getAction();
                   if (action == Action.RIGHT_CLICK_BLOCK || action == Action.RIGHT_CLICK_AIR) {
                       if (manager.addChunk(targetChunk)) {
+                          visualizer.spawnInstantChunkFeedback(player, targetChunk, true);
                           player.sendMessage(Component.text("Чанк [" + targetChunk.getX() + ", " + targetChunk.getZ() + "] добавлен в снежную зону!", NamedTextColor.AQUA));
                       } else {
                           player.sendMessage(Component.text("Этот чанк уже в списке!", NamedTextColor.YELLOW));
                       }
                   } else if (action == Action.LEFT_CLICK_BLOCK || action == Action.LEFT_CLICK_AIR) {
                       if (manager.removeChunk(targetChunk)) {
+                          visualizer.spawnInstantChunkFeedback(player, targetChunk, false);
                           player.sendMessage(Component.text("Чанк [" + targetChunk.getX() + ", " + targetChunk.getZ() + "] удалён, биом восстановлен.", NamedTextColor.GREEN));
                       } else {
                           player.sendMessage(Component.text("Этот чанк не числится в списке снежных.", NamedTextColor.RED));
@@ -694,6 +1167,7 @@ jobs:
                           }
                           Chunk chunk = player.getLocation().getChunk();
                           if (manager.addChunk(chunk)) {
+                              plugin.getVisualizerRunner().spawnInstantChunkFeedback(player, chunk, true);
                               player.sendMessage(Component.text("Чанк [" + chunk.getX() + ", " + chunk.getZ() + "] добавлен!", NamedTextColor.AQUA));
                           } else {
                               player.sendMessage(Component.text("Этот чанк уже добавлен.", NamedTextColor.YELLOW));
@@ -706,6 +1180,7 @@ jobs:
                           }
                           Chunk chunk = player.getLocation().getChunk();
                           if (manager.removeChunk(chunk)) {
+                              plugin.getVisualizerRunner().spawnInstantChunkFeedback(player, chunk, false);
                               player.sendMessage(Component.text("Чанк [" + chunk.getX() + ", " + chunk.getZ() + "] удалён, оригинальный биом возвращён.", NamedTextColor.GREEN));
                           } else {
                               player.sendMessage(Component.text("Этот чанк не найден в списке.", NamedTextColor.RED));
@@ -714,7 +1189,7 @@ jobs:
                       case "addradius" -> {
                           if (!(sender instanceof Player player)) return true;
                           if (args.length < 2) {
-                              player.sendMessage(Component.text("Использование: /sc addradius <радиус_в_чанках>", NamedTextColor.RED));
+                              player.sendMessage(Component.text("Использование: /sc addradius [радиус_в_чанках]", NamedTextColor.RED));
                               return true;
                           }
                           int radius = parseRadius(args[1], player);
@@ -737,7 +1212,7 @@ jobs:
                       case "removeradius" -> {
                           if (!(sender instanceof Player player)) return true;
                           if (args.length < 2) {
-                              player.sendMessage(Component.text("Использование: /sc removeradius <радиус_в_чанках>", NamedTextColor.RED));
+                              player.sendMessage(Component.text("Использование: /sc removeradius [радиус_в_чанках]", NamedTextColor.RED));
                               return true;
                           }
                           int radius = parseRadius(args[1], player);
@@ -763,13 +1238,22 @@ jobs:
                           ItemMeta meta = wand.getItemMeta();
                           meta.displayName(Component.text("Жезл снежных чанков", NamedTextColor.AQUA));
                           meta.lore(List.of(
+                                  Component.text("Держите в руке для подсветки границ", NamedTextColor.AQUA),
                                   Component.text("ПКМ — добавить чанк", NamedTextColor.GRAY),
                                   Component.text("ЛКМ — удалить чанк", NamedTextColor.GRAY)
                           ));
                           meta.getPersistentDataContainer().set(manager.getWandKey(), PersistentDataType.BYTE, (byte) 1);
                           wand.setItemMeta(meta);
                           player.getInventory().addItem(wand);
-                          player.sendMessage(Component.text("Выдан жезл выделения чанков!", NamedTextColor.AQUA));
+                          player.sendMessage(Component.text("Выдан жезл выделения чанков! Возьмите его в руку, чтобы видеть границы.", NamedTextColor.AQUA));
+                      }
+                      case "borders" -> {
+                          boolean current = plugin.getConfig().getBoolean("visualizer.enabled", true);
+                          boolean next = !current;
+                          plugin.getConfig().set("visualizer.enabled", next);
+                          plugin.saveConfig();
+                          sender.sendMessage(Component.text("Подсветка границ чанков жезлом: " + (next ? "ВКЛЮЧЕНА" : "ВЫКЛЮЧЕНА"),
+                                  next ? NamedTextColor.GREEN : NamedTextColor.YELLOW));
                       }
                       case "roll" -> {
                           WeatherMode mode = manager.rollWeatherForAllChunks();
@@ -777,7 +1261,7 @@ jobs:
                       }
                       case "force" -> {
                           if (args.length < 2) {
-                              sender.sendMessage(Component.text("Использование: /sc force <snow|rain|thunder|clear>", NamedTextColor.RED));
+                              sender.sendMessage(Component.text("Использование: /sc force [snow|rain|thunder|clear]", NamedTextColor.RED));
                               return true;
                           }
                           try {
@@ -790,7 +1274,7 @@ jobs:
                       }
                       case "setchance" -> {
                           if (args.length < 3) {
-                              sender.sendMessage(Component.text("Использование: /sc setchance <snow|rain|thunder|clear> <вес>", NamedTextColor.RED));
+                              sender.sendMessage(Component.text("Использование: /sc setchance [snow|rain|thunder|clear] [вес]", NamedTextColor.RED));
                               return true;
                           }
                           String type = args[1].toLowerCase();
@@ -807,6 +1291,28 @@ jobs:
                               sender.sendMessage(Component.text("Введите корректное число.", NamedTextColor.RED));
                           }
                       }
+                      case "maxlayers" -> {
+                          if (args.length < 2) {
+                              sender.sendMessage(Component.text("Использование: /sc maxlayers [1-7]", NamedTextColor.RED));
+                              return true;
+                          }
+                          try {
+                              int layers = Integer.parseInt(args[1]);
+                              if (layers < 1 || layers > 7) {
+                                  sender.sendMessage(Component.text("Высота сугробов должна быть от 1 до 7 слоёв.", NamedTextColor.RED));
+                                  return true;
+                              }
+                              plugin.getConfig().set("snowdrifts.max-layers", layers);
+                              plugin.saveConfig();
+                              sender.sendMessage(Component.text("Максимальная высота сугробов установлена на: " + layers, NamedTextColor.GREEN));
+                          } catch (NumberFormatException e) {
+                              sender.sendMessage(Component.text("Введите целое число от 1 до 7.", NamedTextColor.RED));
+                          }
+                      }
+                      case "meltsnow" -> {
+                          int count = manager.clearSnowInManagedChunks();
+                          sender.sendMessage(Component.text("Мгновенно растоплено снежных блоков в выбранных чанках: " + count, NamedTextColor.GREEN));
+                      }
                       case "list" -> {
                           sender.sendMessage(Component.text("Выбранные чанки (" + manager.getSelectedChunks().size() + "): "
                                   + String.join(", ", manager.getSelectedChunks()), NamedTextColor.AQUA));
@@ -814,6 +1320,7 @@ jobs:
                       case "reload" -> {
                           plugin.reloadConfig();
                           manager.loadChunksFromConfig();
+                          plugin.startTasks();
                           sender.sendMessage(Component.text("Конфигурация SnowChunks перезагружена!", NamedTextColor.GREEN));
                       }
                       default -> sendHelp(sender);
@@ -836,23 +1343,29 @@ jobs:
               }
 
               private void sendHelp(CommandSender sender) {
-                  sender.sendMessage(Component.text("--- Команды SnowChunks ---", NamedTextColor.AQUA));
+                  sender.sendMessage(Component.text("--- Команды SnowChunks v1.2.0 ---", NamedTextColor.AQUA));
                   sender.sendMessage(Component.text("/sc add / remove — добавить/удалить текущий чанк", NamedTextColor.GRAY));
-                  sender.sendMessage(Component.text("/sc addradius <R> / removeradius <R> — добавить/удалить чанки в радиусе", NamedTextColor.GRAY));
-                  sender.sendMessage(Component.text("/sc wand — получить жезл быстрого выбора чанков", NamedTextColor.GRAY));
-                  sender.sendMessage(Component.text("/sc setchance <snow|rain|thunder|clear> <вес> — настроить шанс осадков", NamedTextColor.GRAY));
+                  sender.sendMessage(Component.text("/sc addradius [R] / removeradius [R] — добавить/удалить чанки в радиусе", NamedTextColor.GRAY));
+                  sender.sendMessage(Component.text("/sc wand — получить жезл выбора и подсветки чанков", NamedTextColor.GRAY));
+                  sender.sendMessage(Component.text("/sc borders — вкл/выкл подсветку границ частицами", NamedTextColor.GRAY));
+                  sender.sendMessage(Component.text("/sc setchance [snow|rain|thunder|clear] [вес] — настроить шанс осадков", NamedTextColor.GRAY));
+                  sender.sendMessage(Component.text("/sc maxlayers [1-7] — задать макс. высоту сугробов", NamedTextColor.GRAY));
+                  sender.sendMessage(Component.text("/sc meltsnow — мгновенно растопить весь снег в зонах", NamedTextColor.GRAY));
                   sender.sendMessage(Component.text("/sc roll — перебросить случайный тип осадков по шансам", NamedTextColor.GRAY));
-                  sender.sendMessage(Component.text("/sc force <snow|rain|thunder|clear> — принудительно включить осадки", NamedTextColor.GRAY));
+                  sender.sendMessage(Component.text("/sc force [snow|rain|thunder|clear] — принудительно включить осадки", NamedTextColor.GRAY));
                   sender.sendMessage(Component.text("/sc list / reload — список чанков / перезагрузка конфига", NamedTextColor.GRAY));
               }
 
               @Override
               public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
                   if (args.length == 1) {
-                      return Arrays.asList("add", "remove", "addradius", "removeradius", "wand", "roll", "force", "setchance", "list", "reload");
+                      return Arrays.asList("add", "remove", "addradius", "removeradius", "wand", "borders", "roll", "force", "setchance", "maxlayers", "meltsnow", "list", "reload");
                   }
                   if (args.length == 2 && (args[0].equalsIgnoreCase("force") || args[0].equalsIgnoreCase("setchance"))) {
                       return Arrays.asList("snow", "rain", "thunder", "clear");
+                  }
+                  if (args.length == 2 && args[0].equalsIgnoreCase("maxlayers")) {
+                      return Arrays.asList("1", "2", "3", "4", "5", "6", "7");
                   }
                   return Collections.emptyList();
               }
