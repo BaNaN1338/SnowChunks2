@@ -25,7 +25,6 @@ jobs:
           mkdir -p src/main/java/me/example/snowchunks
           mkdir -p src/main/resources
 
-          # Автоматическое определение доступной версии Paper API
           METADATA=$(curl -s https://repo.papermc.io/repository/maven-public/io/papermc/paper/paper-api/maven-metadata.xml)
           PAPER_VER=$(echo "$METADATA" | grep -oP '(?<=<version>)[^<]+' | grep '^26\.3' | tail -n 1 || true)
           if [ -z "$PAPER_VER" ]; then
@@ -37,7 +36,6 @@ jobs:
           if [ -z "$PAPER_VER" ]; then
             PAPER_VER="1.21.4-R0.1-SNAPSHOT"
           fi
-          echo "Выбрана версия Paper API: $PAPER_VER"
 
           if [[ "$PAPER_VER" == 26.* ]]; then
             JAVA_VER=25
@@ -58,7 +56,7 @@ jobs:
           }
 
           group = "me.example"
-          version = "1.3.0"
+          version = "1.4.0"
 
           repositories {
               mavenCentral()
@@ -80,10 +78,10 @@ jobs:
 
           cat << 'EOF' > src/main/resources/plugin.yml
           name: SnowChunks
-          version: '1.3.0'
+          version: '1.4.0'
           main: me.example.snowchunks.SnowChunksPlugin
           api-version: '1.21'
-          description: Замена дождя на снег, настройка скорости сугробов, таяния и подсветка границ
+          description: Снег в чанках без смены цвета травы, фикс звуков дождя и сугробы
           commands:
             snowchunks:
               aliases: [sc, snowchunk]
@@ -96,37 +94,33 @@ jobs:
           EOF
 
           cat << 'EOF' > src/main/resources/config.yml
-          snow-biome: "minecraft:snowy_plains"
-          fallback-rain-biome: "minecraft:plains"
+          snow-biome: "minecraft:grove"
           per-chunk-roll: false
 
           accumulation:
             allow-snow-layers: true
             allow-ice-form: false
 
-          # Настройки роста глубоких сугробов и скорости появления снежных слоёв
           snowdrifts:
             enabled: true
-            max-layers: 7              # Максимальная высота сугробов (от 1 до 7 слоёв)
-            interval-ticks: 20         # Частота обновления в тиках (20 тиков = 1 секунда)
-            attempts-per-chunk: 10     # Сколько случайных точек в чанке проверяется за интервал (1-256)
-            growth-chance: 0.45        # Шанс нарастить/положить слой снега при проверке (0.0 - 1.0)
+            max-layers: 7
+            interval-ticks: 20
+            attempts-per-chunk: 10
+            growth-chance: 0.45
 
-          # Настройки автоматического таяния снега при солнце или дожде
           melting:
             enabled: true
-            only-daytime: false        # Если true — при ясной погоде снег тает только днём (под дождём тает всегда)
-            attempts-per-chunk: 12     # Скорость таяния: сколько точек в чанке проверяется за интервал (1-256)
-            melt-chance: 0.55          # Шанс уменьшить сугроб на 1 слой при проверке (0.0 - 1.0)
+            only-daytime: false
+            attempts-per-chunk: 12
+            melt-chance: 0.55
 
-          # Настройки визуальной подсветки границ чанков, когда жезл (/sc wand) в руке
           visualizer:
             enabled: true
-            interval-ticks: 10         # Частота отрисовки частиц (10 тиков = каждые 0.5 сек)
-            chunk-radius: 3            # В каком радиусе чанков вокруг игрока показывать границы (1-6)
-            step-blocks: 2             # Шаг между частицами вдоль линии границы (в блоках)
-            show-inner-grid: true      # Показывать ли внутренние границы между соседними снежными чанками
-            show-actionbar: true       # Показывать ли статус текущего чанка над хотбаром
+            interval-ticks: 10
+            chunk-radius: 3
+            step-blocks: 2
+            show-inner-grid: true
+            show-actionbar: true
 
           probabilities:
             snow: 65
@@ -180,7 +174,7 @@ jobs:
                   }
 
                   startTasks();
-                  getLogger().info("SnowChunks v1.3.0 успешно запущен!");
+                  getLogger().info("SnowChunks v1.4.0 успешно запущен!");
               }
 
               public void startTasks() {
@@ -193,7 +187,7 @@ jobs:
 
                   long physInterval = Math.max(1L, getConfig().getLong("snowdrifts.interval-ticks", 20L));
                   SnowPhysicsTask physRunner = new SnowPhysicsTask(this, weatherManager);
-                  this.physicsTask = getServer().getScheduler().runTaskTimer(this, physRunner, physInterval, physInterval);
+                  this.physicsTask =getServer().getScheduler().runTaskTimer(this, physRunner, physInterval, physInterval);
 
                   long visInterval = Math.max(4L, getConfig().getLong("visualizer.interval-ticks", 10L));
                   this.visualizerRunner = new WandVisualizerTask(this, weatherManager);
@@ -256,7 +250,6 @@ jobs:
           public class ChunkWeatherManager {
 
               private final SnowChunksPlugin plugin;
-              private final NamespacedKey origBiomesKey;
               private final NamespacedKey wandKey;
 
               private final Set<String> selectedChunks = new HashSet<>();
@@ -266,7 +259,6 @@ jobs:
 
               public ChunkWeatherManager(SnowChunksPlugin plugin) {
                   this.plugin = plugin;
-                  this.origBiomesKey = new NamespacedKey(plugin, "original_surface_biomes");
                   this.wandKey = new NamespacedKey(plugin, "chunk_selector_wand");
               }
 
@@ -338,9 +330,8 @@ jobs:
                   if (!selectedChunks.add(key)) {
                       return false;
                   }
-                  backupOriginalBiomes(chunk);
                   WeatherMode mode = getChunkMode(chunk);
-                  applyChunkBiomeForMode(chunk, mode);
+                  applyChunkWeatherForMode(chunk, mode);
                   updatePlayersInChunk(chunk);
                   saveChunksToConfig();
                   return true;
@@ -352,7 +343,6 @@ jobs:
                       return false;
                   }
                   chunkModes.remove(key);
-                  restoreOriginalBiomes(chunk);
                   for (Player player : chunk.getWorld().getPlayers()) {
                       if (player.getLocation().getChunk().equals(chunk)) {
                           player.resetPlayerWeather();
@@ -465,146 +455,18 @@ jobs:
                       int cz = Integer.parseInt(parts[2]);
                       if (world.isChunkLoaded(cx, cz)) {
                           Chunk chunk = world.getChunkAt(cx, cz);
-                          applyChunkBiomeForMode(chunk, mode);
+                          applyChunkWeatherForMode(chunk, mode);
                           updatePlayersInChunk(chunk);
                       }
                   } catch (NumberFormatException ignored) {
                   }
               }
 
-              public void backupOriginalBiomes(Chunk chunk) {
-                  PersistentDataContainer pdc = chunk.getPersistentDataContainer();
-                  if (pdc.has(origBiomesKey, PersistentDataType.STRING)) {
-                      return;
-                  }
-
+              public void applyChunkWeatherForMode(Chunk chunk, WeatherMode mode) {
                   World world = chunk.getWorld();
-                  int baseX = chunk.getX() << 4;
-                  int baseZ = chunk.getZ() << 4;
-                  Registry<Biome> registry = RegistryAccess.registryAccess().getRegistry(RegistryKey.BIOME);
-
-                  StringBuilder sb = new StringBuilder();
-                  for (int lx = 0; lx < 16; lx += 4) {
-                      for (int lz = 0; lz < 16; lz += 4) {
-                          int wx = baseX + lx;
-                          int wz = baseZ + lz;
-                          int surfaceY = world.getHighestBlockYAt(wx, wz);
-                          Biome biome = world.getBiome(wx, surfaceY, wz);
-                          NamespacedKey bKey = registry.getKey(biome);
-                          if (!sb.isEmpty()) sb.append(",");
-                          sb.append(bKey != null ? bKey.asString() : "minecraft:plains");
-                      }
+                  if (mode == WeatherMode.THUNDER && world.hasStorm() && !world.isThundering()) {
+                      world.setThundering(true);
                   }
-                  pdc.set(origBiomesKey, PersistentDataType.STRING, sb.toString());
-              }
-
-              public void applyChunkBiomeForMode(Chunk chunk, WeatherMode mode) {
-                  backupOriginalBiomes(chunk);
-                  World world = chunk.getWorld();
-
-                  if (mode == WeatherMode.SNOW || mode == WeatherMode.THUNDER) {
-                      Biome snowBiome = resolveBiome(plugin.getConfig().getString("snow-biome", "minecraft:snowy_plains"), Biome.SNOWY_PLAINS);
-                      setSurfaceToSkyBiome(chunk, snowBiome);
-                      if (mode == WeatherMode.THUNDER && world.hasStorm() && !world.isThundering()) {
-                          world.setThundering(true);
-                      }
-                  } else if (mode == WeatherMode.RAIN) {
-                      restoreOrFallbackRainBiome(chunk);
-                  } else if (mode == WeatherMode.CLEAR) {
-                      restoreOriginalBiomesWithoutRemove(chunk);
-                  }
-              }
-
-              private void setSurfaceToSkyBiome(Chunk chunk, Biome targetBiome) {
-                  World world = chunk.getWorld();
-                  int baseX = chunk.getX() << 4;
-                  int baseZ = chunk.getZ() << 4;
-                  int maxY = world.getMaxHeight();
-                  int minY = world.getMinHeight();
-
-                  for (int lx = 0; lx < 16; lx += 4) {
-                      for (int lz = 0; lz < 16; lz += 4) {
-                          int wx = baseX + lx;
-                          int wz = baseZ + lz;
-                          int startY = Math.max(minY, world.getHighestBlockYAt(wx, wz) - 8);
-                          for (int y = startY; y < maxY; y += 4) {
-                              world.setBiome(wx, y, wz, targetBiome);
-                          }
-                      }
-                  }
-                  world.refreshChunk(chunk.getX(), chunk.getZ());
-              }
-
-              private void restoreOrFallbackRainBiome(Chunk chunk) {
-                  PersistentDataContainer pdc = chunk.getPersistentDataContainer();
-                  String saved = pdc.get(origBiomesKey, PersistentDataType.STRING);
-                  Biome fallbackRain = resolveBiome(plugin.getConfig().getString("fallback-rain-biome", "minecraft:plains"), Biome.PLAINS);
-
-                  if (saved == null || saved.isEmpty()) {
-                      setSurfaceToSkyBiome(chunk, fallbackRain);
-                      return;
-                  }
-
-                  String[] keys = saved.split(",");
-                  World world = chunk.getWorld();
-                  int baseX = chunk.getX() << 4;
-                  int baseZ = chunk.getZ() << 4;
-                  int maxY = world.getMaxHeight();
-                  int minY = world.getMinHeight();
-                  Registry<Biome> registry = RegistryAccess.registryAccess().getRegistry(RegistryKey.BIOME);
-
-                  int idx = 0;
-                  for (int lx = 0; lx < 16; lx += 4) {
-                      for (int lz = 0; lz < 16; lz += 4) {
-                          Biome orig = idx < keys.length ? resolveBiome(keys[idx], fallbackRain) : fallbackRain;
-                          idx++;
-                          NamespacedKey origKey = registry.getKey(orig);
-                          String keyPath = origKey != null ? origKey.getKey() : "";
-                          if (keyPath.contains("snow") || keyPath.contains("frozen") || keyPath.contains("ice")) {
-                              orig = fallbackRain;
-                          }
-                          int wx = baseX + lx;
-                          int wz = baseZ + lz;
-                          int startY = Math.max(minY, world.getHighestBlockYAt(wx, wz) - 8);
-                          for (int y = startY; y < maxY; y += 4) {
-                              world.setBiome(wx, y, wz, orig);
-                          }
-                      }
-                  }
-                  world.refreshChunk(chunk.getX(), chunk.getZ());
-              }
-
-              private void restoreOriginalBiomesWithoutRemove(Chunk chunk) {
-                  PersistentDataContainer pdc = chunk.getPersistentDataContainer();
-                  String saved = pdc.get(origBiomesKey, PersistentDataType.STRING);
-                  if (saved == null || saved.isEmpty()) return;
-
-                  String[] keys = saved.split(",");
-                  World world = chunk.getWorld();
-                  int baseX = chunk.getX() << 4;
-                  int baseZ = chunk.getZ() << 4;
-                  int maxY = world.getMaxHeight();
-                  int minY = world.getMinHeight();
-
-                  int idx = 0;
-                  for (int lx = 0; lx < 16; lx += 4) {
-                      for (int lz = 0; lz < 16; lz += 4) {
-                          if (idx >= keys.length) break;
-                          Biome orig = resolveBiome(keys[idx++], Biome.PLAINS);
-                          int wx = baseX + lx;
-                          int wz = baseZ + lz;
-                          int startY = Math.max(minY, world.getHighestBlockYAt(wx, wz) - 8);
-                          for (int y = startY; y < maxY; y += 4) {
-                              world.setBiome(wx, y, wz, orig);
-                          }
-                      }
-                  }
-                  world.refreshChunk(chunk.getX(), chunk.getZ());
-              }
-
-              public void restoreOriginalBiomes(Chunk chunk) {
-                  restoreOriginalBiomesWithoutRemove(chunk);
-                  chunk.getPersistentDataContainer().remove(origBiomesKey);
               }
 
               public void updatePlayersInChunk(Chunk chunk) {
@@ -624,8 +486,14 @@ jobs:
                   }
 
                   WeatherMode mode = getChunkMode(chunk);
-                  if (mode == WeatherMode.CLEAR && chunk.getWorld().hasStorm()) {
-                      player.setPlayerWeather(WeatherType.CLEAR);
+                  if (chunk.getWorld().hasStorm()) {
+                      if (mode == WeatherMode.SNOW || mode == WeatherMode.THUNDER) {
+                          player.setPlayerWeather(WeatherType.CLEAR);
+                      } else if (mode == WeatherMode.CLEAR) {
+                          player.setPlayerWeather(WeatherType.CLEAR);
+                      } else if (mode == WeatherMode.RAIN) {
+                          player.resetPlayerWeather();
+                      }
                   } else {
                       if (player.getPlayerWeather() != null) {
                           player.resetPlayerWeather();
@@ -639,14 +507,6 @@ jobs:
                           player.resetPlayerWeather();
                       }
                   }
-              }
-
-              private Biome resolveBiome(String keyString, Biome defaultBiome) {
-                  if (keyString == null) return defaultBiome;
-                  NamespacedKey key = NamespacedKey.fromString(keyString.toLowerCase());
-                  if (key == null) return defaultBiome;
-                  Biome biome = RegistryAccess.registryAccess().getRegistry(RegistryKey.BIOME).get(key);
-                  return biome != null ? biome : defaultBiome;
               }
           }
           EOF
@@ -1041,7 +901,7 @@ jobs:
               public void onChunkLoad(ChunkLoadEvent event) {
                   Chunk chunk = event.getChunk();
                   if (manager.isManagedChunk(chunk)) {
-                      manager.applyChunkBiomeForMode(chunk, manager.getChunkMode(chunk));
+                      manager.applyChunkWeatherForMode(chunk, manager.getChunkMode(chunk));
                   }
               }
 
@@ -1063,7 +923,6 @@ jobs:
                           event.setCancelled(true);
                           return;
                       }
-                      // Синхронизируем появление первого ванильного слоя с настроенным шансом появления слоёв
                       if (ThreadLocalRandom.current().nextDouble() > chance) {
                           event.setCancelled(true);
                       }
@@ -1411,7 +1270,6 @@ jobs:
                       }
                   }
 
-                  // Если указан второй параметр — шанс (в процентах 1-100 или дробью 0.01-1.0)
                   if (args.length >= 3) {
                       try {
                           double parsedChance = Double.parseDouble(args[2].replace("%", ""));
@@ -1449,7 +1307,7 @@ jobs:
                   int meltChance = (int) Math.round(plugin.getConfig().getDouble("melting.melt-chance", 0.55) * 100);
                   long tickRate = plugin.getConfig().getLong("snowdrifts.interval-ticks", 20L);
 
-                  sender.sendMessage(Component.text("--- Статус SnowChunks v1.3.0 ---", NamedTextColor.AQUA));
+                  sender.sendMessage(Component.text("--- Статус SnowChunks v1.4.0 ---", NamedTextColor.AQUA));
                   sender.sendMessage(Component.text("Активных чанков: " + manager.getSelectedChunks().size()
                           + " | Режим погоды: " + manager.getGlobalRolledMode().name(), NamedTextColor.WHITE));
                   sender.sendMessage(Component.text("Появление снега: " + (growEnabled ? "ВКЛ (" + growAttempts + " блок/цикл, шанс " + growChance + "%, макс. слоёв: " + maxLayers + ")" : "ВЫКЛ"), NamedTextColor.GREEN));
@@ -1472,7 +1330,7 @@ jobs:
               }
 
               private void sendHelp(CommandSender sender) {
-                  sender.sendMessage(Component.text("--- Команды SnowChunks v1.3.0 ---", NamedTextColor.AQUA));
+                  sender.sendMessage(Component.text("--- Команды SnowChunks v1.4.0 ---", NamedTextColor.AQUA));
                   sender.sendMessage(Component.text("/sc wand — получить жезл выбора и подсветки чанков", NamedTextColor.GRAY));
                   sender.sendMessage(Component.text("/sc borders — вкл/выкл подсветку границ частицами", NamedTextColor.GRAY));
                   sender.sendMessage(Component.text("/sc add / remove — добавить/удалить текущий чанк", NamedTextColor.GRAY));
