@@ -56,7 +56,7 @@ jobs:
           }
 
           group = "me.example"
-          version = "1.4.1"
+          version = "1.4.3"
 
           repositories {
               mavenCentral()
@@ -78,10 +78,10 @@ jobs:
 
           cat << 'EOF' > src/main/resources/plugin.yml
           name: SnowChunks
-          version: '1.4.1'
+          version: '1.4.3'
           main: me.example.snowchunks.SnowChunksPlugin
           api-version: '1.21'
-          description: Снег в чанках с правильным визуалом снегопада и фиксом дождя
+          description: Снег в чанках, сугробы, таяние, подсветка границ и завывание ветра
           commands:
             snowchunks:
               aliases: [sc, snowchunk]
@@ -123,6 +123,10 @@ jobs:
             show-inner-grid: true
             show-actionbar: true
 
+          wind:
+            enabled: true
+            interval-ticks: 60       # Частота завывания ветра (60 тиков = каждые 3 секунды)
+
           probabilities:
             snow: 65
             rain: 20
@@ -155,6 +159,7 @@ jobs:
               private ChunkWeatherManager weatherManager;
               private BukkitTask physicsTask;
               private BukkitTask visualizerTask;
+              private BukkitTask windTask;
               private WandVisualizerTask visualizerRunner;
 
               @Override
@@ -175,16 +180,13 @@ jobs:
                   }
 
                   startTasks();
-                  getLogger().info("SnowChunks v1.4.1 успешно запущен!");
+                  getLogger().info("SnowChunks v1.4.3 успешно запущен!");
               }
 
               public void startTasks() {
-                  if (physicsTask != null) {
-                      physicsTask.cancel();
-                  }
-                  if (visualizerTask != null) {
-                      visualizerTask.cancel();
-                  }
+                  if (physicsTask != null) physicsTask.cancel();
+                  if (visualizerTask != null) visualizerTask.cancel();
+                  if (windTask != null) windTask.cancel();
 
                   long physInterval = Math.max(1L, getConfig().getLong("snowdrifts.interval-ticks", 20L));
                   SnowPhysicsTask physRunner = new SnowPhysicsTask(this, weatherManager);
@@ -193,16 +195,17 @@ jobs:
                   long visInterval = Math.max(4L, getConfig().getLong("visualizer.interval-ticks", 10L));
                   this.visualizerRunner = new WandVisualizerTask(this, weatherManager);
                   this.visualizerTask = getServer().getScheduler().runTaskTimer(this, visualizerRunner, visInterval, visInterval);
+
+                  long windInterval = Math.max(20L, getConfig().getLong("wind.interval-ticks", 60L));
+                  WindAmbientTask windRunner = new WindAmbientTask(this, weatherManager);
+                  this.windTask = getServer().getScheduler().runTaskTimer(this, windRunner, windInterval, windInterval);
               }
 
               @Override
               public void onDisable() {
-                  if (physicsTask != null) {
-                      physicsTask.cancel();
-                  }
-                  if (visualizerTask != null) {
-                      visualizerTask.cancel();
-                  }
+                  if (physicsTask != null) physicsTask.cancel();
+                  if (visualizerTask != null) visualizerTask.cancel();
+                  if (windTask != null) windTask.cancel();
                   if (weatherManager != null) {
                       weatherManager.resetAllPlayerWeather();
                   }
@@ -499,8 +502,6 @@ jobs:
 
                   if (mode == WeatherMode.SNOW || mode == WeatherMode.THUNDER) {
                       Biome snowBiome = resolveBiome(plugin.getConfig().getString("snow-biome", "minecraft:snowy_plains"), Biome.SNOWY_PLAINS);
-                      // Устанавливаем снежный биом только на небе (y >= surfaceY + 4), чтобы клиент рендерил снег,
-                      // но нижняя часть мира и поверхность земли сохраняли родной биом (и родной цвет травы/воды)
                       setSkyOnlyBiome(chunk, snowBiome);
                       if (mode == WeatherMode.THUNDER && world.hasStorm() && !world.isThundering()) {
                           world.setThundering(true);
@@ -524,7 +525,6 @@ jobs:
                           int wx = baseX + lx;
                           int wz = baseZ + lz;
                           int surfaceY = world.getHighestBlockYAt(wx, wz);
-                          // Меняем биом только в воздухе над землей, оставляя поверхность в покое
                           int startY = Math.max(minY, surfaceY + 4);
                           for (int y = startY; y < maxY; y += 4) {
                               world.setBiome(wx, y, wz, targetBiome);
@@ -619,7 +619,7 @@ jobs:
                   }
 
                   WeatherMode mode = getChunkMode(chunk);
-                  if (mode == WeatherMode.CLEAR && chunk.getWorld().hasStorm()) {
+                  if (chunk.getWorld().hasStorm() && (mode == WeatherMode.SNOW || mode == WeatherMode.THUNDER || mode == WeatherMode.CLEAR)) {
                       player.setPlayerWeather(WeatherType.CLEAR);
                   } else {
                       if (player.getPlayerWeather() != null) {
@@ -642,6 +642,51 @@ jobs:
                   if (key == null) return defaultBiome;
                   Biome biome = RegistryAccess.registryAccess().getRegistry(RegistryKey.BIOME).get(key);
                   return biome != null ? biome : defaultBiome;
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/me/example/snowchunks/WindAmbientTask.java
+          package me.example.snowchunks;
+
+          import org.bukkit.Bukkit;
+          import org.bukkit.Chunk;
+          import org.bukkit.Sound;
+          import org.bukkit.World;
+          import org.bukkit.entity.Player;
+
+          public class WindAmbientTask implements Runnable {
+
+              private final SnowChunksPlugin plugin;
+              private final ChunkWeatherManager manager;
+
+              public WindAmbientTask(SnowChunksPlugin plugin, ChunkWeatherManager manager) {
+                  this.plugin = plugin;
+                  this.manager = manager;
+              }
+
+              @Override
+              public void run() {
+                  if (!plugin.getConfig().getBoolean("wind.enabled", true)) {
+                      return;
+                  }
+
+                  for (Player player : Bukkit.getOnlinePlayers()) {
+                      World world = player.getWorld();
+                      if (!world.hasStorm()) continue;
+
+                      Chunk chunk = player.getLocation().getChunk();
+                      if (!manager.isManagedChunk(chunk)) continue;
+
+                      WeatherMode mode = manager.getChunkMode(chunk);
+                      if (mode == WeatherMode.SNOW || mode == WeatherMode.THUNDER) {
+                          float volume = (mode == WeatherMode.THUNDER) ? 0.7f : 0.4f;
+                          float pitch = (mode == WeatherMode.THUNDER) ? 0.6f : 0.8f;
+                          
+                          // Воспроизводим атмосферный звук ветра для игрока локально
+                          player.playSound(player.getLocation(), Sound.WEATHER_RAIN, volume, pitch);
+                      }
+                  }
               }
           }
           EOF
@@ -1442,7 +1487,7 @@ jobs:
                   int meltChance = (int) Math.round(plugin.getConfig().getDouble("melting.melt-chance", 0.55) * 100);
                   long tickRate = plugin.getConfig().getLong("snowdrifts.interval-ticks", 20L);
 
-                  sender.sendMessage(Component.text("--- Статус SnowChunks v1.4.1 ---", NamedTextColor.AQUA));
+                  sender.sendMessage(Component.text("--- Статус SnowChunks v1.4.3 ---", NamedTextColor.AQUA));
                   sender.sendMessage(Component.text("Активных чанков: " + manager.getSelectedChunks().size()
                           + " | Режим погоды: " + manager.getGlobalRolledMode().name(), NamedTextColor.WHITE));
                   sender.sendMessage(Component.text("Появление снега: " + (growEnabled ? "ВКЛ (" + growAttempts + " блок/цикл, шанс " + growChance + "%, макс. слоёв: " + maxLayers + ")" : "ВЫКЛ"), NamedTextColor.GREEN));
@@ -1465,7 +1510,7 @@ jobs:
               }
 
               private void sendHelp(CommandSender sender) {
-                  sender.sendMessage(Component.text("--- Команды SnowChunks v1.4.1 ---", NamedTextColor.AQUA));
+                  sender.sendMessage(Component.text("--- Команды SnowChunks v1.4.3 ---", NamedTextColor.AQUA));
                   sender.sendMessage(Component.text("/sc wand — получить жезл выбора и подсветки чанков", NamedTextColor.GRAY));
                   sender.sendMessage(Component.text("/sc borders — вкл/выкл подсветку границ частицами", NamedTextColor.GRAY));
                   sender.sendMessage(Component.text("/sc add / remove — добавить/удалить текущий чанк", NamedTextColor.GRAY));
@@ -1499,7 +1544,6 @@ jobs:
                           return Arrays.asList("slow", "normal", "fast", "turbo", "off", "5", "15", "30", "60");
                       }
                       if (sub.equals("tickrate") || sub.equals("physicsinterval")) {
-                          name:
                           return Arrays.asList("5", "10", "20", "40", "60");
                       }
                   }
