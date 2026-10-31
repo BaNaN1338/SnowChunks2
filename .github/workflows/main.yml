@@ -17,7 +17,7 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.12.1'
+          gradle-version: '8.14'
 
       - name: Generate Project Files and Compile
         run: |
@@ -198,7 +198,7 @@ jobs:
 
                   long windInterval = Math.max(20L, getConfig().getLong("wind.interval-ticks", 60L));
                   WindAmbientTask windRunner = new WindAmbientTask(this, weatherManager);
-                  this.windTask = getServer().getScheduler().runTaskTimer(this, windInterval, windInterval);
+                  this.windTask = getServer().getScheduler().runTaskTimer(this, windRunner, windInterval, windInterval);
               }
 
               @Override
@@ -370,12 +370,6 @@ jobs:
                   return true;
               }
 
-              /**
-               * Принудительно восстанавливает биомы в чанке, даже если конфиг был удалён.
-               * 1) Если в PDC чанка сохранился бэкап — берёт точные биомы оттуда.
-               * 2) Дополнительно проверяет биом на уровне поверхности (который плагин не менял)
-               *    и копирует его вверх до максимальной высоты мира, если наверху остался снежный биом.
-               */
               public boolean forceFixChunk(Chunk chunk, boolean clearSnowBlocks) {
                   String key = toKey(chunk);
                   boolean wasManaged = selectedChunks.remove(key);
@@ -404,7 +398,6 @@ jobs:
                           int wz = baseZ + lz;
                           int surfaceY = world.getHighestBlockYAt(wx, wz);
 
-                          // На уровне поверхности (или чуть ниже) всегда оставался родной биом чанка
                           Biome groundBiome = world.getBiome(wx, Math.max(minY, surfaceY), wz);
                           if (groundBiome == snowBiome) {
                               groundBiome = fallbackBiome;
@@ -1026,7 +1019,7 @@ jobs:
               private void growSnowdriftsInChunk(World world, int cx, int cz, int configuredMaxLayers, int attempts, double chance) {
                   ThreadLocalRandom random = ThreadLocalRandom.current();
                   int baseX = cx << 4;
-                  int baseZ = cz << 4;
+                  int baseZ = chunkBase(cz);
 
                   for (int i = 0; i < attempts; i++) {
                       if (random.nextDouble() > chance) continue;
@@ -1061,6 +1054,10 @@ jobs:
                           }
                       }
                   }
+              }
+
+              private int chunkBase(int c) {
+                  return c << 4;
               }
 
               private void meltSnowInChunk(World world, int cx, int cz, int attempts, double chance) {
